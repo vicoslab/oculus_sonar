@@ -1,16 +1,19 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- these are local variables for the launch file -->
-    <arg name="port" default="this_is_a_port"/>
 
-    <!-- respawn : will restart if killed
-        required : will kill every thing if this node is killed -->
-    <node name="oculus_sonar" pkg="oculus_sonar" type="oculus_sonar_node"
-          respawn="true" output="screen">
-        <param name="port" value="$(arg port)"/>
-        <rosparam>
-            ping_topic:   "ping"
-            status_topic: "status"
-        </rosparam>
+    <node name="oculus_sonar_node" pkg="oculus_sonar" type="oculus_sonar_node" output="screen">
+        <param name="frequency_mode" value="1" /> <!-- Low freq -->
+        <param name="ping_rate" value="1" /> <!-- 15 hz-->
+        <param name="data_depth" value="0" /> <!-- 8 bit-->
+        <param name="nbeams" value="1" />  <!-- 512 beams -->
+        <param name="send_gain" value="true" />  <!-- do we need that? -->
+        <param name="gain_assist" value="true" />  <!-- yes please -->
+        <param name="range" value="40.0" />  <!-- maxed out-->
+        <param name="gamma_correction" value="127" />  <!-- I guess? -->
+        <param name="gain_percent" value="30.0" />  <!-- guesstimated, probably overriden by gain assist -->
+        <param name="sound_speed" value="1537" />  <!-- 25 deg, 38 ppm salinity -->
+        <param name="use_salinity" value="true" /> <!-- 8 bit-->
+        <param name="salinity" value="38" /> <!-- mediterranean -->
     </node>
+
 </launch>

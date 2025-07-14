@@ -22,18 +22,29 @@ OculusNode::OculusNode(const std::string& nodeName) :
     node_.param<std::string>("ping_topic_deprecated",  pingTopicDeprecated_,  "ping_deprecated");
     pingPublisherDeprecated_ = node_.advertise<oculus_sonar::OculusPing>(pingTopicDeprecated_, 100);
 
-    sonar_.add_ping_callback(   std::bind(&OculusNode::ping_callback,
-                                          this, std::placeholders::_1));
-    sonar_.add_message_callback(std::bind(&OculusNode::message_callback,
-                                          this, std::placeholders::_1));
-    sonar_.add_status_callback( std::bind(&OculusNode::status_callback,
-                                          this, std::placeholders::_1));
-    sonar_.add_dummy_callback(  std::bind(&OculusNode::dummy_callback,
-                                          this, std::placeholders::_1));
+    sonar_.add_ping_callback(   std::bind(&OculusNode::ping_callback, this, std::placeholders::_1));
+    sonar_.add_message_callback(std::bind(&OculusNode::message_callback,  this, std::placeholders::_1));
+    sonar_.add_status_callback( std::bind(&OculusNode::status_callback, this, std::placeholders::_1));
+    sonar_.add_dummy_callback(  std::bind(&OculusNode::dummy_callback, this, std::placeholders::_1));
     this->start();
 
-    configServer_.setCallback(std::bind(&OculusNode::reconfigure_callback, this,
-                                        std::placeholders::_1, std::placeholders::_2));
+    configServer_.setCallback(std::bind(&OculusNode::reconfigure_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+    // Initialize config with launch defaults
+    oculus_sonar::OculusSonarConfig initialConfig;
+    node_.param<int>("frequency_mode",        initialConfig.frequency_mode, 1);
+    node_.param<int>("ping_rate",             initialConfig.ping_rate, 0);
+    node_.param<int>("data_depth",            initialConfig.data_depth, 0);
+    node_.param<int>("nbeams",                initialConfig.nbeams, 0);
+    node_.param<bool>("send_gain",            initialConfig.send_gain, false);
+    node_.param<bool>("gain_assist",          initialConfig.gain_assist, false);
+    node_.param<double>("range",              initialConfig.range, 3.0);
+    node_.param<int>("gamma_correction",      initialConfig.gamma_correction, 127);
+    node_.param<double>("gain_percent",       initialConfig.gain_percent, 50.0);
+    node_.param<double>("sound_speed",        initialConfig.sound_speed, 1500.0);
+    node_.param<bool>("use_salinity",         initialConfig.use_salinity, true);
+    node_.param<double>("salinity",           initialConfig.salinity, 35.0);
+    this->reconfigure_callback(initialConfig, 0);
 }
 
 OculusNode::~OculusNode()
