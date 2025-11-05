@@ -29,6 +29,19 @@ OculusNode::OculusNode(const std::string& nodeName) :
     this->start();
 
     configServer_.setCallback(std::bind(&OculusNode::reconfigure_callback, this, std::placeholders::_1, std::placeholders::_2));
+}
+
+OculusNode::~OculusNode()
+{
+    this->stop();
+}
+
+void OculusNode::start()
+{
+    service_.start();
+    if(!sonar_.wait_next_message()) {
+        throw std::runtime_error("Timeout reached while waiting for sonar. Is it plugged in ?");
+    }
 
     // Initialize config with launch defaults
     oculus_sonar::OculusSonarConfig initialConfig;
@@ -45,19 +58,6 @@ OculusNode::OculusNode(const std::string& nodeName) :
     node_.param<bool>("use_salinity",         initialConfig.use_salinity, true);
     node_.param<double>("salinity",           initialConfig.salinity, 35.0);
     this->reconfigure_callback(initialConfig, 0);
-}
-
-OculusNode::~OculusNode()
-{
-    this->stop();
-}
-
-void OculusNode::start()
-{
-    service_.start();
-    if(!sonar_.wait_next_message()) {
-        throw std::runtime_error("Timeout reached while waiting for sonar. Is it plugged in ?");
-    }
 }
 
 void OculusNode::stop()
