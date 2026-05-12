@@ -8,59 +8,52 @@
 #include <oculus_driver/OculusMessage.h>
 
 #include <oculus_sonar/OculusStatus.h>
-#include <oculus_sonar/Ping.h>
-#include <oculus_sonar/OculusStampedPing.h>
+#include <oculus_sonar/SonarConfig.h>
+
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/CompressedImage.h>
+#include <sensor_msgs/Temperature.h>
+#include <sensor_msgs/FluidPressure.h>
+#include <opencv2/imgcodecs.hpp>
 
 #include <dynamic_reconfigure/server.h>
 #include <oculus_sonar/OculusSonarConfig.h>
 
 class OculusNode
 {
-    protected:
+	protected:
 
-    std::string pingTopic_;
-    std::string statusTopic_;
-    std::string pingImageTopic_;
-    std::string rawTopic_;
-    std::string pingTopicDeprecated_;
-    bool        publishWithoutSubs_;
+	std::string pingImageTopic_;
+	bool publishWithoutSubs_;
 
-    ros::NodeHandle node_;
+	ros::NodeHandle node_;
 
-    ros::Publisher pingPublisher_;
-    ros::Publisher statusPublisher_;
-    ros::Publisher imagePublisher_;
-    ros::Publisher rawPublisher_;
-    ros::Publisher pingPublisherDeprecated_;
+	ros::Publisher imagePublisher_;
+	ros::Publisher compressedImagePublisher_;
+	ros::Publisher configPublisher_;
+	ros::Publisher temperaturePublisher_;
+	ros::Publisher pressurePublisher_;
 
-    dynamic_reconfigure::Server<oculus_sonar::OculusSonarConfig> configServer_;
+	dynamic_reconfigure::Server<oculus_sonar::OculusSonarConfig> configServer_;
 
-    oculus::AsyncService service_;
-    oculus::SonarDriver  sonar_;
+	oculus::AsyncService service_;
+	oculus::SonarDriver sonar_;
 
-    public:
+	public:
 
-    OculusNode(const std::string& nodeName);
-    ~OculusNode();
+	OculusNode(const std::string& nodeName);
+	~OculusNode();
 
-    void start();
-    void stop();
+	void start();
+	void stop();
 
-    void ping_callback(const oculus::PingMessage::ConstPtr& msg);
-    void status_callback(const OculusStatusMsg& status);
-    void message_callback(const oculus::Message::ConstPtr& msg);
+	void ping_callback(const oculus::PingMessage::ConstPtr& msg);
+	void status_callback(const OculusStatusMsg& status);
+	void dummy_callback(const OculusMessageHeader& msg);
 
-    void reconfigure_callback(oculus_sonar::OculusSonarConfig& config,
-                              int32_t level);
+	void reconfigure_callback(oculus_sonar::OculusSonarConfig& config, int32_t level);
 
-    bool has_ping_subscribers() const;
-    void dummy_callback(const OculusMessageHeader& msg);
-
-    // this will be removed in future releases
-    void publish_deprecated(const oculus::PingMessage::ConstPtr& msg);
+	bool has_ping_subscribers() const;
 };
-
-
-
 
 #endif //_OCULUS_SONAR_OCULUS_NODE_H_

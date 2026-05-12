@@ -1,7 +1,7 @@
-<?xml version="1.0"?>
 <launch>
 
-    <node name="oculus_sonar_node" pkg="oculus_sonar" type="oculus_sonar_node" output="screen">
+    <!-- Driver-->
+    <node name="oculus_sonar_node" pkg="oculus_sonar" type="oculus_sonar_node">
         <param name="frequency_mode" value="1" /> <!-- Low freq -->
         <param name="ping_rate" value="1" /> <!-- 15 hz-->
         <param name="data_depth" value="0" /> <!-- 8 bit-->
@@ -16,4 +16,9 @@
         <param name="salinity" value="38" /> <!-- mediterranean -->
     </node>
 
-</launch>
+    <!-- Image reprojector -->
+    <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector.py" output="screen">
+        <param name="downsample_factor" value="0.25" /> <!--quarter res-->
+    </node>
+
+</launch> 

@@ -1,0 +1,124 @@
+#!/usr/bin/python3
+import rospy
+import math
+import cv2
+import numpy as np
+import tf
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import Pose, Point, Quaternion
+from dynamic_reconfigure.server import Server
+from oculus_sonar.cfg import SonarReprojectorConfig
+from oculus_sonar.msg import SonarConfig
+
+FOV_BY_MODE = {1: 130.0, 2: 80.0}
+
+class SonarFanToOccupancyGrid:
+	def __init__(self):
+		rospy.init_node('sonar_occupancy_node')
+		self.bridge = CvBridge()
+		self.fov_degrees = 130.0
+		self.max_range_m = 40.0
+		self.downsample_factor = 1.0
+		self.sonar_frame = 'oculus_link'
+		self.image_topic = rospy.get_param('~image_topic', '/oculus_sonar/image')
+		self.grid_topic = rospy.get_param('~grid_topic', '/oculus_sonar/grid')
+		self.config_topic = rospy.get_param('~config_topic', '/oculus_sonar/config')
+
+		# cached remap state
+		self._map_x = None
+		self._map_y = None
+		self._invalid_mask = None
+		self._last_remap_key = None  # (h, w, fov_degrees, downsample_factor)
+
+		self.image_sub = rospy.Subscriber(self.image_topic, Image, self.image_callback, queue_size=1)
+		self.grid_pub = rospy.Publisher(self.grid_topic, OccupancyGrid, queue_size=1)
+		self.config_sub = rospy.Subscriber(self.config_topic, SonarConfig, self.sonar_config_callback, queue_size=1)
+		self.server = Server(SonarReprojectorConfig, self.reconfig_callback)
+
+	def sonar_config_callback(self, msg):
+		self.max_range_m = msg.range
+		self.fov_degrees = FOV_BY_MODE.get(msg.frequency_mode, 130.0)
+
+	def reconfig_callback(self, config, level):
+		self.downsample_factor = config.downsample_factor
+		self.sonar_frame = config.sonar_frame
+		return config
+
+	def _rebuild_maps(self, h, w):
+		angle_range_rad = np.deg2rad(self.fov_degrees)
+		# output is only the bottom half (the fan), so height = h, width = 2*h
+		out_h = h
+		out_w = 2 * h
+		cx = out_w // 2
+		cy = out_h - 1  # bottom of the half-canvas maps to range=0
+
+		ys, xs = np.indices((out_h, out_w))
+		dx = xs - cx
+		dy = cy - ys  # y increases upward in sonar space
+		r = np.sqrt(dx**2 + dy**2)
+		angle = np.arctan2(dx, dy)
+
+		col_map = ((angle + angle_range_rad / 2.0) / angle_range_rad) * (w - 1)
+		edge_noise_cut = 4
+		valid = (
+			(col_map >= 0) & (col_map < w - edge_noise_cut) &
+			(r >= 0) & (r < h) &
+			(np.abs(angle) <= angle_range_rad / 2.0)
+		)
+
+		map_x = np.where(valid, col_map, 0).astype(np.float32)
+		map_y = np.where(valid, r, 0).astype(np.float32)
+
+		if self.downsample_factor != 1.0:
+			new_h = int(round(out_h * self.downsample_factor))
+			new_w = int(round(out_w * self.downsample_factor))
+			map_x = cv2.resize(map_x, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+			map_y = cv2.resize(map_y, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+			valid = cv2.resize(valid.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+		self._map_x = map_x
+		self._map_y = map_y
+		self._invalid_mask = ~valid
+		self._last_remap_key = (h, w, self.fov_degrees, self.downsample_factor)
+
+	def image_callback(self, msg):
+		self.image_sub.unregister()
+		try:
+			img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+			h, w = img.shape
+			img = cv2.flip(img, 1)
+
+			remap_key = (h, w, self.fov_degrees, self.downsample_factor)
+			if remap_key != self._last_remap_key:
+				self._rebuild_maps(h, w)
+
+			canvas = cv2.remap(img, self._map_x, self._map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+			canvas[self._invalid_mask] = 0
+
+			res_m_per_pixel = self.max_range_m / canvas.shape[0]
+			height, width = canvas.shape
+
+			grid = OccupancyGrid()
+			grid.header.stamp = msg.header.stamp + rospy.Duration(0.5)
+			grid.header.frame_id = self.sonar_frame
+			grid.info.resolution = res_m_per_pixel
+			grid.info.width = width
+			grid.info.height = height
+			origin_x = width / 2.0 * res_m_per_pixel
+			origin_y = -height * res_m_per_pixel
+			grid.info.origin.position = Point(x=origin_x, y=origin_y, z=0.0)
+			quat = tf.transformations.quaternion_from_euler(0, 0, math.radians(90))
+			grid.info.origin.orientation = Quaternion(*quat)
+			grid.data = canvas.astype(np.int8).flatten().tolist()
+			self.grid_pub.publish(grid)
+		except Exception as e:
+			rospy.logerr("Error in sonar fan to occupancy grid: %s", str(e))
+		self.image_sub = rospy.Subscriber(self.image_topic, Image, self.image_callback, queue_size=1)
+
+	def run(self):
+		rospy.spin()
+
+if __name__ == '__main__':
+	SonarFanToOccupancyGrid().run()

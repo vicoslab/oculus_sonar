@@ -1,0 +1,12 @@
+int32 frequency_mode
+int32 ping_rate
+int32 data_depth
+int32 nbeams
+bool send_gain
+bool gain_assist
+float64 range
+int32 gamma_correction
+float64 gain_percent
+float64 sound_speed
+bool use_salinity
+float64 salinity

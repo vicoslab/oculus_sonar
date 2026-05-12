@@ -10,7 +10,10 @@ find_package(catkin REQUIRED COMPONENTS
     dynamic_reconfigure
 )
 
-generate_dynamic_reconfigure_options(${CMAKE_CURRENT_SOURCE_DIR}/cfg/OculusSonar.cfg)
+generate_dynamic_reconfigure_options(
+    cfg/OculusSonar.cfg
+    cfg/SonarReprojectorConfig.cfg
+)
 
 find_package(oculus_driver QUIET)
 if(NOT TARGET oculus_driver)
@@ -22,6 +25,8 @@ if(NOT TARGET oculus_driver)
     FetchContent_MakeAvailable(oculus_driver)
 endif()
 
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
+
 add_message_files(FILES
    OculusHeader.msg
    OculusVersionInfo.msg
@@ -31,6 +36,7 @@ add_message_files(FILES
    OculusStampedPing.msg
    Raw.msg
    Ping.msg
+   SonarConfig.msg
 )
 
 ## Generate added messages and services with any dependencies listed here
@@ -52,6 +58,7 @@ target_include_directories(oculus_sonar_node PRIVATE src)
 target_link_libraries(oculus_sonar_node PRIVATE
     ${catkin_LIBRARIES}
     oculus_driver
+    ${OpenCV_LIBS}
 )
 add_dependencies(oculus_sonar_node oculus_sonar_generate_messages_cpp ${PROJECT_NAME}_gencfg)
 
@@ -71,9 +78,10 @@ if(TARGET rtac_display)
     add_dependencies(oculus_sonar_display oculus_sonar_generate_messages_cpp ${PROJECT_NAME}_gencfg)
 endif()
 
-# installing converter script
-catkin_install_python(PROGRAMS scripts/bag_to_oculus
-                      DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
-
-
-
+file(
+    GLOB PYTHON_SCRIPTS_DIR "scripts/*.py"
+)
+catkin_install_python(
+    PROGRAMS ${PYTHON_SCRIPTS_DIR}
+    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

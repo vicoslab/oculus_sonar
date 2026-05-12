@@ -2,7 +2,6 @@
 #define _DEF_OCULUS_ROS_CONVERSIONS_H_
 
 #include <oculus_driver/Oculus.h>
-
 #include <sensor_msgs/Image.h>
 
 #include <oculus_sonar/OculusHeader.h>
