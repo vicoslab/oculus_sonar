@@ -1,7 +1,7 @@
 <launch>
 
     <!-- Driver-->
-    <node name="oculus_sonar_node" pkg="oculus_sonar" type="oculus_sonar_node">
+    <node name="oculus_sonar_node" pkg="oculus_sonar" type="oculus_sonar_node" output="screen">
         <param name="frequency_mode" value="1" /> <!-- Low freq -->
         <param name="ping_rate" value="1" /> <!-- 15 hz-->
         <param name="data_depth" value="0" /> <!-- 8 bit-->
@@ -13,12 +13,13 @@
         <param name="gain_percent" value="30.0" />  <!-- guesstimated, probably overriden by gain assist -->
         <param name="sound_speed" value="1537" />  <!-- 25 deg, 38 ppm salinity -->
         <param name="use_salinity" value="true" /> <!-- 8 bit-->
-        <param name="salinity" value="38" /> <!-- mediterranean -->
+        <param name="salinity" value="0" /> <!-- inland -->
     </node>
 
     <!-- Image reprojector -->
     <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector.py" output="screen">
         <param name="downsample_factor" value="0.25" /> <!--quarter res-->
+        <param name="use_compressed" value="false" /> <!--true for png compressed bag review-->
     </node>
 
 </launch> 

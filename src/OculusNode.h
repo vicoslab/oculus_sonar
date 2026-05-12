@@ -23,7 +23,6 @@ class OculusNode
 {
 	protected:
 
-	std::string pingImageTopic_;
 	bool publishWithoutSubs_;
 
 	ros::NodeHandle node_;

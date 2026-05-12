@@ -5,12 +5,11 @@
 #include <opencv2/imgcodecs.hpp>
 
 OculusNode::OculusNode(const std::string& nodeName): node_(nodeName), configServer_(node_),	sonar_(service_.io_service()){
-	node_.param<std::string>("ping_image_topic", pingImageTopic_, "ping_image");
 	node_.param<bool>("publish_without_subs", publishWithoutSubs_, false);
 
-	imagePublisher_ = node_.advertise<sensor_msgs::Image>(pingImageTopic_, 100);
-	compressedImagePublisher_ = node_.advertise<sensor_msgs::CompressedImage>(pingImageTopic_ + "/compressed", 100);
-	configPublisher_ = node_.advertise<oculus_sonar::SonarConfig>("sonar_config", 1, true); // latched
+	imagePublisher_ = node_.advertise<sensor_msgs::Image>("image", 100);
+	compressedImagePublisher_ = node_.advertise<sensor_msgs::CompressedImage>("image/compressed", 100);
+	configPublisher_ = node_.advertise<oculus_sonar::SonarConfig>("config", 1, true); // latched
 	temperaturePublisher_ = node_.advertise<sensor_msgs::Temperature>("temperature", 1);
 	pressurePublisher_ = node_.advertise<sensor_msgs::FluidPressure>("pressure", 1);
 
@@ -83,24 +82,19 @@ void OculusNode::ping_callback(const oculus::PingMessage::ConstPtr& ping){
 void OculusNode::status_callback(const OculusStatusMsg& status){
 	ros::Time stamp = ros::Time::now();
 
-	// filter sentinels (e.g. -99.0) before taking max
-	std::vector<double> temps;
+	double max_temp = 0.0;
 	for(double t : {status.temperature0, status.temperature1, status.temperature2, status.temperature3, status.temperature4, status.temperature5, status.temperature6, status.temperature7}){
-		if(t > -50.0){
-            temps.push_back(t);
+		if(t > max_temp){
+            max_temp = t;
         }
     }
 
-	if(!temps.empty()) {
-		double max_temp = *std::max_element(temps.begin(), temps.end());
-
-		sensor_msgs::Temperature tempMsg;
-		tempMsg.header.stamp = stamp;
-		tempMsg.header.frame_id = "oculus_link";
-		tempMsg.temperature = max_temp;
-		tempMsg.variance = 0.0;
-		temperaturePublisher_.publish(tempMsg);
-	}
+	sensor_msgs::Temperature tempMsg;
+	tempMsg.header.stamp = stamp;
+	tempMsg.header.frame_id = "oculus_link";
+	tempMsg.temperature = max_temp;
+	tempMsg.variance = 0.0;
+	temperaturePublisher_.publish(tempMsg);
 
 	// Blueprint docs don't specify pressure units. Empirically the values are consistent with gauge bar
 	// at shallow depth (0.017 bar expected at 17cm fresh water, observed ~-0.057 with apparent zero offset).
@@ -114,6 +108,8 @@ void OculusNode::status_callback(const OculusStatusMsg& status){
 }
 
 void OculusNode::reconfigure_callback(oculus_sonar::OculusSonarConfig& config, int32_t level){
+    ROS_INFO("Reconfigure callback triggered, level=%d", level);
+
 	oculus::SonarDriver::PingConfig currentConfig;
 	std::memset(&currentConfig, 0, sizeof(currentConfig));
 
@@ -163,6 +159,9 @@ void OculusNode::reconfigure_callback(oculus_sonar::OculusSonarConfig& config, i
 		currentConfig.speedOfSound = config.sound_speed;
 	currentConfig.salinity = config.salinity;
 
+    
+    ROS_INFO("Requesting ping config from sonar...");
+
 	auto feedback = sonar_.request_ping_config(currentConfig);
 	config.frequency_mode = feedback.masterMode;
 	config.data_depth = (feedback.flags & 0x02) ? 1 : 0;
@@ -174,6 +173,8 @@ void OculusNode::reconfigure_callback(oculus_sonar::OculusSonarConfig& config, i
 	config.gain_percent = feedback.gainPercent;
 	config.sound_speed = feedback.speedOfSound;
 	config.salinity = feedback.salinity;
+
+    ROS_INFO("Got feedback, publishing config");
 
 	oculus_sonar::SonarConfig configMsg;
 	configMsg.frequency_mode = config.frequency_mode;
@@ -189,6 +190,8 @@ void OculusNode::reconfigure_callback(oculus_sonar::OculusSonarConfig& config, i
 	configMsg.use_salinity = config.use_salinity;
 	configMsg.salinity = config.salinity;
 	configPublisher_.publish(configMsg);
+
+	ROS_INFO("Config published to sonar_config topic");
 }
 
 bool OculusNode::has_ping_subscribers() const{
