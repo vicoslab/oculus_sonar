@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
 generate_dynamic_reconfigure_options(
     cfg/OculusSonar.cfg
     cfg/SonarReprojectorConfig.cfg
+    cfg/SonarReprojectorFilteredConfig.cfg
 )
 
 find_package(oculus_driver QUIET)

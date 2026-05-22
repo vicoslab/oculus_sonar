@@ -1,0 +1,15 @@
+<launch>
+
+
+    <!-- Image reprojector -->
+    <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector.py" output="screen">
+        <param name="downsample_factor" value="1.0" />
+        <param name="use_compressed" value="true" /> 
+    </node>
+
+    <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector_filtered.py" output="screen">
+        <param name="downsample_factor" value="1.0" /> 
+        <param name="use_compressed" value="true" />
+    </node>
+
+</launch> 

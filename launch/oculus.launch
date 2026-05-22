@@ -18,7 +18,7 @@
 
     <!-- Image reprojector -->
     <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector.py" output="screen">
-        <param name="downsample_factor" value="0.25" /> <!--quarter res-->
+        <param name="downsample_factor" value="0.5" /> <!--quarter res-->
         <param name="use_compressed" value="false" /> <!--true for png compressed bag review-->
     </node>
 
