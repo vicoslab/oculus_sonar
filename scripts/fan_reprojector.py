@@ -14,7 +14,7 @@ from oculus_sonar.msg import SonarConfig
 
 class SonarFanToOccupancyGrid:
 	def __init__(self):
-		rospy.init_node('sonar_occupancy_node')
+		rospy.init_node('fan_reprojector_node')
 		self.bridge = CvBridge()
 		self.fov_degrees = 130.0
 		self.max_range_m = 40.0
@@ -32,7 +32,6 @@ class SonarFanToOccupancyGrid:
 		self._map_x = None
 		self._map_y = None
 		self._invalid_mask = None
-		self._last_remap_key = None  # (h, w, fov_degrees, downsample_factor)
 
 		if self.use_compressed:
 			self.image_sub = rospy.Subscriber(self.compressed_topic, CompressedImage, self.image_callback_compressed, queue_size=1)
@@ -53,6 +52,8 @@ class SonarFanToOccupancyGrid:
 
 	def _rebuild_maps(self, h, w):
 		angle_range_rad = np.deg2rad(self.fov_degrees)
+		half_fov = angle_range_rad / 2.0
+		
 		# output is only the bottom half (the fan), so height = h, width = 2*h
 		out_h = h
 		out_w = 2 * h
@@ -63,14 +64,23 @@ class SonarFanToOccupancyGrid:
 		dx = xs - cx
 		dy = cy - ys  # y increases upward in sonar space
 		r = np.sqrt(dx**2 + dy**2)
+		
+		# True real-world geometric angle of this specific pixel on the grid
 		angle = np.arctan2(dx, dy)
 
-		col_map = ((angle + angle_range_rad / 2.0) / angle_range_rad) * (w - 1)
+		# Acoustic arrays are usually uniform in sine-space: sin(theta) = k * index
+		# Map physical grid angle back into unrectified sonar sensor space
+		sin_max = np.sin(half_fov)
+		# Normalize sine value between -1.0 and 1.0 across the FOV
+		norm_sin = np.sin(angle) / sin_max
+		# Remap linearly to raw image columns (0 to w-1)
+		col_map = ((norm_sin + 1.0) / 2.0) * (w - 1)
+
 		edge_noise_cut = 4
 		valid = (
 			(col_map >= 0) & (col_map < w - edge_noise_cut) &
 			(r >= 0) & (r < h) &
-			(np.abs(angle) <= angle_range_rad / 2.0)
+			(np.abs(angle) <= half_fov)
 		)
 
 		map_x = np.where(valid, col_map, 0).astype(np.float32)
@@ -120,7 +130,6 @@ class SonarFanToOccupancyGrid:
 		quat = tf.transformations.quaternion_from_euler(0, 0, math.radians(90))
 		grid.info.origin.orientation = Quaternion(*quat)
 
-		#grid.data = canvas.astype(np.int8).flatten().tolist()
 		grid.data = np.asarray(canvas, dtype=np.int8).ravel()
 
 		self.grid_pub.publish(grid)
