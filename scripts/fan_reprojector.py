@@ -32,6 +32,7 @@ class SonarFanToOccupancyGrid:
 		self._map_x = None
 		self._map_y = None
 		self._invalid_mask = None
+		self._last_remap_key = None
 
 		if self.use_compressed:
 			self.image_sub = rospy.Subscriber(self.compressed_topic, CompressedImage, self.image_callback_compressed, queue_size=1)
