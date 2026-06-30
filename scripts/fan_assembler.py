@@ -7,12 +7,12 @@ import cv2
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import Range
+from sensor_msgs.msg import Range, Imu
 from collections import deque
 import tf.transformations as tft
 
 CELL_SIZE = 0.10
-INTENSITY_THRESHOLD = 50
+INTENSITY_THRESHOLD = 90
 OVERLAP_GATE = 1.0
 NADIR_ANGLE_DEG = 19  # steepest ray of the swath, first to hit bottom
 NADIR_TAN = np.tan(np.radians(NADIR_ANGLE_DEG))
@@ -41,11 +41,9 @@ class SonarStitcher:
 		self.direction_yaw = None
 		self.pub_prescaler = 0
 
-		self.clahe = cv2.createCLAHE(clipLimit=20.0, tileGridSize=(8, 8))
-
 		self.pub = rospy.Publisher("/oculus_sonar/stacked_grid", OccupancyGrid, queue_size=1)
 		self.echosounder_sub = rospy.Subscriber("/echosounder/range", Range, self.echo_cb,  queue_size=1)
-		self.cmd_vel_sub = rospy.Subscriber("/cmd_vel", Twist, self.cmd_vel_cb,  queue_size=1)
+		self.cmd_vel_sub = rospy.Subscriber("/imu/data", Imu, self.imu_cb,  queue_size=1)
 		self.direction_sub = rospy.Subscriber("/oculus_stacker/direction", PoseStamped, self.direction_cb, queue_size=1)
 
 		self.enabled = False
@@ -65,9 +63,9 @@ class SonarStitcher:
 			self.enabled = msg.data
 			self.enabled_pub.publish(self.enabled)
 
-	def cmd_vel_cb(self, msg: Twist):
+	def imu_cb(self, msg: Twist):
 		# discard big turns
-		self.do_mapping = abs(msg.angular.z) < 0.5
+		self.do_mapping = abs(msg.angular_velocity.z) < 0.2
 
 	def echo_cb(self, msg: Range):
 		self.echo_window.append(msg.range)
@@ -147,13 +145,8 @@ class SonarStitcher:
 		world_y = pts[1]
 
 		raw = np.array(msg.data, dtype=np.int16)
-		raw[raw < 0] = 0
-
-		# CLAHE
-		img = raw.reshape(rows, cols).astype(np.uint8)
-		img = self.clahe.apply(img)
-
-		raw = img.astype(np.float32).ravel()
+		raw[raw < 0] += 256
+		raw = raw.astype(np.float32)
 
 		# nadir mask: drop cells within the blind zone radius of the sonar XY position
 		if self.nadir_radius is not None:
@@ -163,7 +156,7 @@ class SonarStitcher:
 			raw[xy_dist < self.nadir_radius] = 0
 			raw[xy_dist > 18] = 0
 
-		#filter mid
+		#suppress middle
 		sonar_wx = mat[0, 3]
 		sonar_wy = mat[1, 3]
 		sonar_yaw = np.arctan2(mat[1, 0], mat[0, 0])
@@ -189,11 +182,11 @@ class SonarStitcher:
 		if len(ix) == 0:
 			return
 		
-		intensities = 255.0 * (intensities / 255.0) ** 5.0
+		intensities = 255.0 * (intensities / 255.0) ** 2.0
 
-		self.grid_data[iy, ix] = self.grid_data[iy, ix] * 0.95 + intensities * 0.05
+		self.grid_data[iy, ix] = self.grid_data[iy, ix] * 0.9 + intensities * 0.25
 
-		self.pub_prescaler = (self.pub_prescaler + 1 ) % 10
+		self.pub_prescaler = (self.pub_prescaler + 1 ) % 5
 		if self.pub_prescaler == 0:
 			self.publish(msg.header.stamp)
 
