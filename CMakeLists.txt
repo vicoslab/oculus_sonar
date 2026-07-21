@@ -16,7 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
 generate_dynamic_reconfigure_options(
     cfg/OculusSonar.cfg
     cfg/SonarReprojectorConfig.cfg
-    cfg/SonarReprojectorFilteredConfig.cfg
+    cfg/FanAssembler.cfg
 )
 
 find_package(oculus_driver QUIET)
@@ -30,7 +30,6 @@ if(NOT TARGET oculus_driver)
 endif()
 
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
-find_package(Eigen3 REQUIRED)
 
 add_message_files(FILES
    OculusHeader.msg
@@ -53,10 +52,7 @@ generate_messages(DEPENDENCIES
 catkin_package(CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs geometry_msgs nav_msgs tf2 tf2_ros)
 
 # replace with target include directories ?
-include_directories(${catkin_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
-
-add_executable(sonar_stitcher src/sonar_stitcher.cpp)
-target_link_libraries(sonar_stitcher ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
+include_directories(${catkin_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 
 add_executable(oculus_sonar_node
     src/OculusNode.cpp

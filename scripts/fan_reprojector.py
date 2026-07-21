@@ -113,12 +113,15 @@ class SonarFanToOccupancyGrid:
 		res_m_per_pixel = self.max_range_m / canvas.shape[0]
 		height, width = canvas.shape
 
-		lo, hi = int(canvas.min()), int(canvas.max())
-		if hi > lo:
-			cv2.normalize(canvas, canvas, 0, 255, cv2.NORM_MINMAX)
+		# percentile stretch over fan pixels only, so hot pixels or the zeroed
+		# corners outside the fan don't swing the exposure between frames
+		lo, hi = np.percentile(canvas[~self._invalid_mask], (1.0, 99.9))
+		if hi - lo >= 1.0:
+			canvas = np.clip((canvas.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
+			canvas[self._invalid_mask] = 0
 
 		grid = OccupancyGrid()
-		grid.header.stamp = stamp + rospy.Duration(0.5)
+		grid.header.stamp = stamp
 		grid.header.frame_id = self.sonar_frame
 		grid.info.resolution = res_m_per_pixel
 		grid.info.width = width
