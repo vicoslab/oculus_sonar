@@ -1,0 +1,17 @@
+<launch>
+
+    <!-- Image reprojector -->
+    <node name="fan_reprojector_image" pkg="oculus_sonar" type="fan_reprojector_image.py" output="screen">
+        <param name="use_compressed" value="true" />
+        <param name="base_frame" value="base_link" />
+        <param name="meters_per_pixel" value="0.02" />
+    </node>
+
+    <!-- Map assembler. Publish "true" on /oculus_stacker/enabled to start mapping. -->
+    <node name="fan_image_saver" pkg="oculus_sonar" type="fan_image_saver.py" output="screen">
+        <param name="fixed_frame" value="local"/>
+        <param name="base_frame" value="base_link" />
+        <param name="output_dir" value="~/sonar_export/test" />
+    </node>
+
+</launch>
