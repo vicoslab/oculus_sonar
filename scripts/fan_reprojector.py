@@ -34,6 +34,12 @@ class SonarFanToOccupancyGrid:
 		self._invalid_mask = None
 		self._last_remap_key = None
 
+		#Middle artefact filtering
+		self.beam_suppress_width = 8
+		self.beam_suppress_pad = 2
+		self.beam_suppress_bands = 8
+		self.beam_suppress_threshold = 2.0
+
 		if self.use_compressed:
 			self.image_sub = rospy.Subscriber(self.compressed_topic, CompressedImage, self.image_callback_compressed, queue_size=1)
 		else:
@@ -99,7 +105,46 @@ class SonarFanToOccupancyGrid:
 		self._invalid_mask = ~valid
 		self._last_remap_key = (h, w, self.fov_degrees, self.downsample_factor)
 
+
+	def _suppress_center_beam(self, img):
+		if self.beam_suppress_width <= 0:
+			return img
+
+		f = img.astype(np.float32)
+		h, w = f.shape
+		c = w // 2
+		half = int(self.beam_suppress_width)
+
+		lo = max(c - half, 0)
+		hi = min(c + half + 1, w)
+		rlo = max(c - half * (1 + int(self.beam_suppress_pad)), 0)
+		rhi = min(c + half * (1 + int(self.beam_suppress_pad)) + 1, w)
+
+		win = f[:, rlo:rhi]
+		il = lo - rlo
+		ir = hi - rlo
+
+		nbands = max(1, min(int(self.beam_suppress_bands), h // 8))
+		edges = np.linspace(0, h, nbands + 1).astype(int)
+		prof = np.stack([np.median(win[a:b], axis=0) for a, b in zip(edges[:-1], edges[1:])])
+
+		ref = np.median(np.concatenate([prof[:, :il], prof[:, ir:]], axis=1), axis=1, keepdims=True)
+		excess = prof - ref
+		excess[:, :il] = 0.0
+		excess[:, ir:] = 0.0
+		excess[excess < self.beam_suppress_threshold] = 0.0
+
+		if nbands > 1:
+			excess = cv2.resize(excess, (excess.shape[1], h), interpolation=cv2.INTER_LINEAR)
+		else:
+			excess = np.repeat(excess, h, axis=0)
+
+		out = img.copy()
+		out[:, rlo:rhi] = np.clip(win - excess, 0, 255).astype(img.dtype)
+		return out
+
 	def _process_image(self, img, stamp):
+		img = self._suppress_center_beam(img)
 		h, w = img.shape
 		img = cv2.flip(img, 1)
 
@@ -112,13 +157,6 @@ class SonarFanToOccupancyGrid:
 
 		res_m_per_pixel = self.max_range_m / canvas.shape[0]
 		height, width = canvas.shape
-
-		# percentile stretch over fan pixels only, so hot pixels or the zeroed
-		# corners outside the fan don't swing the exposure between frames
-		lo, hi = np.percentile(canvas[~self._invalid_mask], (1.0, 99.9))
-		if hi - lo >= 1.0:
-			canvas = np.clip((canvas.astype(np.float32) - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
-			canvas[self._invalid_mask] = 0
 
 		grid = OccupancyGrid()
 		grid.header.stamp = stamp

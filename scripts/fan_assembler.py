@@ -17,11 +17,22 @@ from oculus_sonar.msg import SonarConfig
 
 FOV_DEG = 130.0
 GRID_MARGIN = 10
+SAT_COUNT = 255
+UNOBSERVED = 1
+EDGE_EXCLUDE_DEG = 4.0
 
-# auto exposure percentiles: low bound rejects dropouts, high bound rejects isolated
-# hot pixels but must stay high enough to reach sparse targets covering <1% of the image
-NORM_PCT_LO = 1.0
-NORM_PCT_HI = 99.9
+DISPLAY_MIN = 2
+DISPLAY_MAX = 255
+
+# backwards jumps smaller than this are just out-of-order frames, not a replay restart
+TIME_JUMP_TOLERANCE = 1.0
+
+# one scan per position cell per yaw sector, so dwelling in one spot cannot
+# bury a patch under hundreds of near-identical looks
+VIEWPOINT_CELL_M = 0.5
+VIEWPOINT_YAW_BINS = 18
+
+PUBLISH_BAND_CELLS = 1 << 22
 
 class FanAssembler:
 	def __init__(self):
@@ -44,7 +55,8 @@ class FanAssembler:
 		self.half_fov = np.radians(FOV_DEG / 2.0)
 		self.sin_max = np.sin(self.half_fov)
 
-		self.log_odds = None
+		self.sum = None
+		self.count = None
 		self.grid_origin_x = 0.0
 		self.grid_origin_y = 0.0
 		self.grid_w = 0
@@ -53,6 +65,8 @@ class FanAssembler:
 		self.do_mapping = True
 		self.direction_yaw = None
 		self.frame_counter = 0
+		self.last_stamp = None
+		self.viewpoints = set()
 
 		self.pub = rospy.Publisher("/oculus_sonar/stacked_grid", OccupancyGrid, queue_size=1, latch=True)
 		self.config_sub = rospy.Subscriber("/oculus_sonar/config", SonarConfig, self.sonar_config_cb, queue_size=1)
@@ -105,13 +119,39 @@ class FanAssembler:
 			else:
 				img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
 
-			self.process_frame(img.astype(np.float32), msg.header.stamp)
+			self.process_frame(img, msg.header.stamp)
 		except Exception as e:
 			rospy.logwarn_throttle(5.0, f"Frame processing failed: {e}")
 
 		self.image_sub = self.subscribe_image()
 
+	def time_jumped(self, stamp):
+		if self.last_stamp is None or stamp >= self.last_stamp - rospy.Duration(TIME_JUMP_TOLERANCE):
+			self.last_stamp = stamp
+			return False
+
+		# tf2 rejects every transform older than what it already holds, so a replay
+		# restart wedges lookups permanently until the buffer is emptied
+		rospy.logwarn(f"Time jumped back {(self.last_stamp - stamp).to_sec():.1f} s, clearing TF buffer")
+		self.tf_buffer.clear()
+		self.last_stamp = None
+		self.viewpoints.clear()
+		return True
+
+	def seen_viewpoint(self, sx, sy, yaw):
+		sector = int(yaw % (2.0 * np.pi) / (2.0 * np.pi / VIEWPOINT_YAW_BINS)) % VIEWPOINT_YAW_BINS
+		key = (int(np.floor(sx / VIEWPOINT_CELL_M)), int(np.floor(sy / VIEWPOINT_CELL_M)), sector)
+
+		if key in self.viewpoints:
+			return True
+
+		self.viewpoints.add(key)
+		return False
+
 	def process_frame(self, img, stamp):
+		if self.time_jumped(stamp):
+			return
+
 		try:
 			tf_stamped = self.tf_buffer.lookup_transform(self.fixed_frame, self.sonar_frame, stamp, rospy.Duration(0.2))
 		except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
@@ -127,67 +167,41 @@ class FanAssembler:
 			if diff > np.radians(self.cfg.direction_gate_deg):
 				return
 
+		if self.seen_viewpoint(t.x, t.y, yaw):
+			return
+
 		# full rotation, the sonar may be mounted with a substantial tilt
 		rot = tft.quaternion_matrix([r.x, r.y, r.z, r.w])[:2, :2]
 
 		img = cv2.flip(img, 1)  # match the beam order convention of the display reprojector
-		evidence = self.polar_evidence(img)
-		if evidence is None:
-			return
-
-		self.integrate(evidence, rot, t.x, t.y)
+		intensity, valid = self.polar_frame(img)
+		self.integrate(intensity, valid, rot, t.x, t.y)
 
 		self.frame_counter = (self.frame_counter + 1) % self.cfg.publish_every
 		if self.frame_counter == 0:
 			self.publish(stamp)
 
-	def polar_evidence(self, img):
-		c = self.cfg
+	def polar_frame(self, img):
+		w = img.shape[1]
 
-		# per-frame auto exposure, percentiles so single hot pixels or dropouts don't rescale everything
-		lo, hi = np.percentile(img, (NORM_PCT_LO, NORM_PCT_HI))
-		if hi - lo < 1e-3:
-			return None
-		intensity = np.clip((img - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
-
-		occupied = intensity >= c.t_occ
-		evidence = np.zeros_like(intensity)
-		evidence[occupied] = c.l_occ * (intensity[occupied] - c.t_occ) / max(1.0 - c.t_occ, 1e-3)
-		evidence[intensity <= c.t_free] = -c.l_free
-
-		h, w = intensity.shape
-		bin_m = self.range_m / h
-		ranges = (np.arange(h) + 0.5) * bin_m
-
-		# acoustic shadow is occlusion, not free space: cells beyond the first strong
-		# return in a beam carry no information and must not erase anything
-		margin_bins = max(1, int(round(c.occlusion_margin / bin_m)))
-		strong = np.maximum.accumulate(occupied, axis=0)
-		shadowed = np.zeros_like(occupied)
-		shadowed[margin_bins:] = strong[:-margin_bins]
-		evidence[shadowed & ~occupied] = 0.0
-
-		# confidence: ramp up over the nadir/fish clutter zone, taper off at far range
-		w_range = np.clip(ranges / max(c.near_range_full, 1e-3), 0.0, 1.0)
-		far_start = c.far_taper_start * self.range_m
-		far = np.clip((ranges - far_start) / max(self.range_m - far_start, 1e-3), 0.0, 1.0)
-		w_range *= 1.0 - (1.0 - c.far_taper_floor) * far
-
-		# columns are uniform in sine space across the FOV, taper the weak edge beams
+		# columns are uniform in sine space across the FOV
 		sin_bearing = (2.0 * np.arange(w) / (w - 1) - 1.0) * self.sin_max
 		bearing = np.arcsin(np.clip(sin_bearing, -1.0, 1.0))
-		w_bearing = np.clip((self.half_fov - np.abs(bearing)) / np.radians(c.edge_taper_deg), 0.0, 1.0)
 
-		evidence *= w_range[:, None].astype(np.float32) * w_bearing[None, :].astype(np.float32)
-		return evidence
+		# the outermost beams have too little array gain to average usefully, and
+		# attenuating them would only feed the mean darker samples, so discard them
+		edge_ok = self.half_fov - np.abs(bearing) >= np.radians(EDGE_EXCLUDE_DEG)
+
+		return img, np.broadcast_to(edge_ok, img.shape).astype(np.uint8) * 255
 
 	def ensure_capacity(self, min_x, max_x, min_y, max_y):
-		if self.log_odds is None:
+		if self.count is None:
 			self.grid_origin_x = (np.floor(min_x / self.cell_size) - GRID_MARGIN) * self.cell_size
 			self.grid_origin_y = (np.floor(min_y / self.cell_size) - GRID_MARGIN) * self.cell_size
 			self.grid_w = int(np.ceil((max_x - self.grid_origin_x) / self.cell_size)) + GRID_MARGIN
 			self.grid_h = int(np.ceil((max_y - self.grid_origin_y) / self.cell_size)) + GRID_MARGIN
-			self.log_odds = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+			self.sum = np.zeros((self.grid_h, self.grid_w), dtype=np.uint16)
+			self.count = np.zeros((self.grid_h, self.grid_w), dtype=np.uint8)
 			return
 
 		ix_min = int(np.floor((min_x - self.grid_origin_x) / self.cell_size))
@@ -203,16 +217,20 @@ class FanAssembler:
 		if pad_left or pad_right or pad_down or pad_up:
 			new_w = self.grid_w + pad_left + pad_right
 			new_h = self.grid_h + pad_down + pad_up
-			new_data = np.zeros((new_h, new_w), dtype=np.float32)
-			new_data[pad_down:pad_down + self.grid_h, pad_left:pad_left + self.grid_w] = self.log_odds
-			self.log_odds = new_data
+
+			for name in ("sum", "count"):
+				old = getattr(self, name)
+				grown = np.zeros((new_h, new_w), dtype=old.dtype)
+				grown[pad_down:pad_down + self.grid_h, pad_left:pad_left + self.grid_w] = old
+				setattr(self, name, grown)
+
 			self.grid_origin_x -= pad_left * self.cell_size
 			self.grid_origin_y -= pad_down * self.cell_size
 			self.grid_w = new_w
 			self.grid_h = new_h
 
-	def integrate(self, evidence, rot, sx, sy):
-		h, w = evidence.shape
+	def integrate(self, intensity, valid, rot, sx, sy):
+		h, w = intensity.shape
 		bin_m = self.range_m / h
 
 		det = rot[0, 0] * rot[1, 1] - rot[0, 1] * rot[1, 0]
@@ -252,14 +270,38 @@ class FanAssembler:
 		rows = np.where(inside, rows, -10.0).astype(np.float32)
 		cols = np.where(inside, cols, -10.0).astype(np.float32)
 
-		update = cv2.remap(evidence, cols, rows, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+		patch = cv2.remap(intensity, cols, rows, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+		cover = cv2.remap(valid, cols, rows, interpolation=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-		region = self.log_odds[iy0:iy1, ix0:ix1]
-		np.clip(region + update, self.cfg.l_min, self.cfg.l_max, out=region)
+		sum_region = self.sum[iy0:iy1, ix0:ix1]
+		count_region = self.count[iy0:iy1, ix0:ix1]
+
+		# a zero sample is a dropout, not a dark observation: it must not enter the mean
+		fresh = (patch > 0) & (cover > 0) & (count_region < SAT_COUNT)
+
+		# uint16 sums can never overflow: capping the count at 255 bounds any cell at 255 * 255
+		contrib = patch.astype(np.uint16)
+		contrib *= fresh
+		sum_region += contrib
+		count_region += fresh
 
 	def publish(self, stamp):
-		display = np.clip(self.log_odds / self.cfg.l_max, 0.0, 1.0) ** self.cfg.display_gamma
-		data = (display * 255.0).astype(np.uint8).astype(np.int8)
+		if self.count is None:
+			return
+
+		display = np.empty((self.grid_h, self.grid_w), dtype=np.uint8)
+		band = max(1, PUBLISH_BAND_CELLS // max(self.grid_w, 1))
+
+		for y0 in range(0, self.grid_h, band):
+			y1 = min(y0 + band, self.grid_h)
+			counts = self.count[y0:y1]
+
+			mean = self.sum[y0:y1].astype(np.float32) / np.maximum(counts, 1)
+			mean += DISPLAY_MIN
+			np.clip(mean, DISPLAY_MIN, DISPLAY_MAX, out=mean)
+
+			np.copyto(display[y0:y1], mean.astype(np.uint8))
+			np.copyto(display[y0:y1], np.uint8(UNOBSERVED), where=counts == 0)
 
 		out = OccupancyGrid()
 		out.header.stamp = stamp
@@ -270,7 +312,7 @@ class FanAssembler:
 		out.info.origin.position.x = self.grid_origin_x
 		out.info.origin.position.y = self.grid_origin_y
 		out.info.origin.orientation.w = 1.0
-		out.data = data.ravel().tolist()
+		out.data = display.view(np.int8).ravel().tolist()
 		self.pub.publish(out)
 
 if __name__ == "__main__":

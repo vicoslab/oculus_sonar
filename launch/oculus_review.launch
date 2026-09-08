@@ -1,10 +1,11 @@
 <launch>
 
-    <!-- Image reprojector -->
+    <!-- Image reprojector 
     <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector.py" output="screen">
         <param name="downsample_factor" value="1.0" />
-        <param name="use_compressed" value="true" />
-    </node>
+        <param name="use_compressed" value="false" />
+        <remap from="/oculus_sonar/image" to="/oculus_sonar/ping_image"/>
+    </node>-->
 
     <!-- Map assembler. Publish "true" on /oculus_stacker/enabled to start mapping. -->
     <node name="fan_assembler" pkg="oculus_sonar" type="fan_assembler.py" output="screen">
