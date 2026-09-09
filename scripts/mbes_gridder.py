@@ -24,9 +24,9 @@ class BathymetryAccumulator(object):
 		self.publish_rate = rospy.get_param("~publish_rate", 1.0)
 		self.transform_timeout = rospy.Duration(rospy.get_param("~transform_timeout", 0.2))
 
-		self.resolution = rospy.get_param("~resolution", 0.5)
+		self.resolution = rospy.get_param("~resolution", 0.3)
 		self.cell_quantile = rospy.get_param("~cell_quantile", 0.5)
-		self.min_hits = rospy.get_param("~min_hits", 3)
+		self.min_hits = rospy.get_param("~min_hits", 1)
 		self.neighbour_radius = int(rospy.get_param("~neighbour_radius", 2))
 		self.mad_gain = rospy.get_param("~mad_gain", 3.0)
 		self.min_deviation = rospy.get_param("~min_deviation", 0.05)

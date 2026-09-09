@@ -4,33 +4,30 @@ import numpy as np
 import tf2_ros
 import cv2
 
+from collections import deque
+
 from std_msgs.msg import Bool
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import Image, CompressedImage, Imu
+from sensor_msgs.msg import Image, CompressedImage, Imu, Range
 from cv_bridge import CvBridge
 from dynamic_reconfigure.server import Server
 import tf.transformations as tft
 
 from oculus_sonar.cfg import FanAssemblerConfig
 from oculus_sonar.msg import SonarConfig
+from sonar_geometry import FOV_DEG, bearing_to_column, beam_bearings, plane_det, plane_inverse, strip_gains, suppress_center_beam
 
-FOV_DEG = 130.0
+VERTICAL_FOV_DEG = 20.0
 GRID_MARGIN = 10
 SAT_COUNT = 255
 UNOBSERVED = 1
-EDGE_EXCLUDE_DEG = 4.0
-
-DISPLAY_MIN = 2
-DISPLAY_MAX = 255
 
 # backwards jumps smaller than this are just out-of-order frames, not a replay restart
 TIME_JUMP_TOLERANCE = 1.0
 
-# one scan per position cell per yaw sector, so dwelling in one spot cannot
-# bury a patch under hundreds of near-identical looks
-VIEWPOINT_CELL_M = 0.5
-VIEWPOINT_YAW_BINS = 18
+NADIR_MEDIAN_WINDOW = 5
+VIEWPOINT_RESET_LEVEL = 1
 
 PUBLISH_BAND_CELLS = 1 << 22
 
@@ -40,20 +37,17 @@ class FanAssembler:
 		self.bridge = CvBridge()
 
 		self.fixed_frame = rospy.get_param("~fixed_frame", "local")
-		self.sonar_frame = rospy.get_param("~sonar_frame", "oculus_link")
+		self.sonar_frame = rospy.get_param("~sonar_frame", "oculus_stabilized")
 		self.cell_size = rospy.get_param("~cell_size", 0.05)
 		self.use_compressed = rospy.get_param("~use_compressed", True)
+		self.gain_normalise = rospy.get_param("~gain_normalise", False)
 		self.image_topic = rospy.get_param("~image_topic", "/oculus_sonar/image")
 		self.range_m = rospy.get_param("~default_range", 25.0)
-
-		self.cfg = None
-		self.cfg_server = Server(FanAssemblerConfig, self.reconfig_cb)
 
 		self.tf_buffer = tf2_ros.Buffer()
 		self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
 		self.half_fov = np.radians(FOV_DEG / 2.0)
-		self.sin_max = np.sin(self.half_fov)
 
 		self.sum = None
 		self.count = None
@@ -68,9 +62,16 @@ class FanAssembler:
 		self.last_stamp = None
 		self.viewpoints = set()
 
+		self.range_window = deque(maxlen=NADIR_MEDIAN_WINDOW)
+		self.altitude = None
+
+		self.cfg = None
+		self.cfg_server = Server(FanAssemblerConfig, self.reconfig_cb)
+
 		self.pub = rospy.Publisher("/oculus_sonar/stacked_grid", OccupancyGrid, queue_size=1, latch=True)
 		self.config_sub = rospy.Subscriber("/oculus_sonar/config", SonarConfig, self.sonar_config_cb, queue_size=1)
 		self.imu_sub = rospy.Subscriber("/imu/data", Imu, self.imu_cb, queue_size=1)
+		self.echosounder_sub = rospy.Subscriber("/echosounder/range", Range, self.echosounder_cb, queue_size=1)
 		self.direction_sub = rospy.Subscriber("/oculus_stacker/direction", PoseStamped, self.direction_cb, queue_size=1)
 
 		self.enabled = False
@@ -87,6 +88,11 @@ class FanAssembler:
 
 	def reconfig_cb(self, config, level):
 		self.cfg = config
+
+		# the gate keys encode the quantisation, so old entries mean nothing once it changes
+		if level & VIEWPOINT_RESET_LEVEL:
+			self.viewpoints.clear()
+
 		return config
 
 	def sonar_config_cb(self, msg):
@@ -99,6 +105,15 @@ class FanAssembler:
 
 	def imu_cb(self, msg: Imu):
 		self.do_mapping = abs(msg.angular_velocity.z) < self.cfg.max_yaw_rate
+
+	def echosounder_cb(self, msg: Range):
+		if not np.isfinite(msg.range) or msg.range < msg.min_range or msg.range > msg.max_range:
+			return
+
+		self.range_window.append(msg.range)
+
+		if len(self.range_window) == NADIR_MEDIAN_WINDOW:
+			self.altitude = float(np.median(self.range_window))
 
 	def enabled_cb(self, msg: Bool):
 		if msg.data != self.enabled:
@@ -119,7 +134,7 @@ class FanAssembler:
 			else:
 				img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
 
-			self.process_frame(img, msg.header.stamp)
+			self.process_frame(strip_gains(img, self.gain_normalise), msg.header.stamp)
 		except Exception as e:
 			rospy.logwarn_throttle(5.0, f"Frame processing failed: {e}")
 
@@ -136,17 +151,34 @@ class FanAssembler:
 		self.tf_buffer.clear()
 		self.last_stamp = None
 		self.viewpoints.clear()
+		self.range_window.clear()
+		self.altitude = None
 		return True
 
 	def seen_viewpoint(self, sx, sy, yaw):
-		sector = int(yaw % (2.0 * np.pi) / (2.0 * np.pi / VIEWPOINT_YAW_BINS)) % VIEWPOINT_YAW_BINS
-		key = (int(np.floor(sx / VIEWPOINT_CELL_M)), int(np.floor(sy / VIEWPOINT_CELL_M)), sector)
+		bins = self.cfg.viewpoint_yaw_bins
+		cell = self.cfg.viewpoint_cell_m
+
+		sector = int(yaw % (2.0 * np.pi) / (2.0 * np.pi / bins)) % bins
+		key = (int(np.floor(sx / cell)), int(np.floor(sy / cell)), sector)
 
 		if key in self.viewpoints:
 			return True
 
 		self.viewpoints.add(key)
 		return False
+
+	def nadir_cut(self, mat):
+		if self.altitude is None:
+			return 0.0
+
+		tilt = np.arcsin(np.clip(-mat[2, 0], -1.0, 1.0)) + np.radians(VERTICAL_FOV_DEG / 2.0)
+		if tilt <= np.radians(1.0):
+			return 0.0
+
+		cut = 0.5 * self.altitude / np.sin(tilt)
+
+		return float(np.clip(cut, 0.0, max(0.0, self.range_m - self.cfg.nadir_margin_m)))
 
 	def process_frame(self, img, stamp):
 		if self.time_jumped(stamp):
@@ -171,11 +203,14 @@ class FanAssembler:
 			return
 
 		# full rotation, the sonar may be mounted with a substantial tilt
-		rot = tft.quaternion_matrix([r.x, r.y, r.z, r.w])[:2, :2]
+		mat = tft.quaternion_matrix([r.x, r.y, r.z, r.w])
+		rot = mat[:2, :2]
+
+		img = suppress_center_beam(img, self.cfg.beam_suppress_width, threshold=self.cfg.beam_suppress_threshold)
 
 		img = cv2.flip(img, 1)  # match the beam order convention of the display reprojector
 		intensity, valid = self.polar_frame(img)
-		self.integrate(intensity, valid, rot, t.x, t.y)
+		self.integrate(intensity, valid, rot, t.x, t.y, self.nadir_cut(mat))
 
 		self.frame_counter = (self.frame_counter + 1) % self.cfg.publish_every
 		if self.frame_counter == 0:
@@ -184,13 +219,11 @@ class FanAssembler:
 	def polar_frame(self, img):
 		w = img.shape[1]
 
-		# columns are uniform in sine space across the FOV
-		sin_bearing = (2.0 * np.arange(w) / (w - 1) - 1.0) * self.sin_max
-		bearing = np.arcsin(np.clip(sin_bearing, -1.0, 1.0))
+		bearing = beam_bearings(w, self.half_fov)
 
 		# the outermost beams have too little array gain to average usefully, and
 		# attenuating them would only feed the mean darker samples, so discard them
-		edge_ok = self.half_fov - np.abs(bearing) >= np.radians(EDGE_EXCLUDE_DEG)
+		edge_ok = self.half_fov - np.abs(bearing) >= np.radians(self.cfg.edge_exclude_deg)
 
 		return img, np.broadcast_to(edge_ok, img.shape).astype(np.uint8) * 255
 
@@ -229,11 +262,11 @@ class FanAssembler:
 			self.grid_w = new_w
 			self.grid_h = new_h
 
-	def integrate(self, intensity, valid, rot, sx, sy):
+	def integrate(self, intensity, valid, rot, sx, sy, nadir_cut):
 		h, w = intensity.shape
 		bin_m = self.range_m / h
 
-		det = rot[0, 0] * rot[1, 1] - rot[0, 1] * rot[1, 0]
+		det = plane_det(rot)
 		if abs(det) < 0.2:
 			rospy.logwarn_throttle(5.0, "Sonar plane near-vertical, skipping frame")
 			return
@@ -255,18 +288,14 @@ class FanAssembler:
 		dx = wx - sx
 		dy = wy - sy
 
-		# invert the world XY projection of the sonar beam plane: solve
-		# rot @ (a, b) = (dx, dy) for in-plane coordinates, where returns are
-		# assumed to lie on the plane (centre of the vertical aperture)
-		a = (rot[1, 1] * dx - rot[0, 1] * dy) / det
-		b = (rot[0, 0] * dy - rot[1, 0] * dx) / det
+		a, b = plane_inverse(dx, dy, rot, det)
 		r = np.sqrt(a * a + b * b)
 		bearing = np.arctan2(b, a)
 
 		inside = (r < self.range_m) & (np.abs(bearing) < self.half_fov)
 
 		rows = r / bin_m - 0.5
-		cols = ((np.sin(bearing) / self.sin_max) + 1.0) / 2.0 * (w - 1)
+		cols = bearing_to_column(bearing, w, self.half_fov)
 		rows = np.where(inside, rows, -10.0).astype(np.float32)
 		cols = np.where(inside, cols, -10.0).astype(np.float32)
 
@@ -276,8 +305,7 @@ class FanAssembler:
 		sum_region = self.sum[iy0:iy1, ix0:ix1]
 		count_region = self.count[iy0:iy1, ix0:ix1]
 
-		# a zero sample is a dropout, not a dark observation: it must not enter the mean
-		fresh = (patch > 0) & (cover > 0) & (count_region < SAT_COUNT)
+		fresh = (patch > 0) & (cover > 0) & (count_region < SAT_COUNT) & ((r >= nadir_cut) | (count_region == 0))
 
 		# uint16 sums can never overflow: capping the count at 255 bounds any cell at 255 * 255
 		contrib = patch.astype(np.uint16)
@@ -292,13 +320,16 @@ class FanAssembler:
 		display = np.empty((self.grid_h, self.grid_w), dtype=np.uint8)
 		band = max(1, PUBLISH_BAND_CELLS // max(self.grid_w, 1))
 
+		display_min = self.cfg.display_min
+		display_max = max(self.cfg.display_max, display_min)
+
 		for y0 in range(0, self.grid_h, band):
 			y1 = min(y0 + band, self.grid_h)
 			counts = self.count[y0:y1]
 
 			mean = self.sum[y0:y1].astype(np.float32) / np.maximum(counts, 1)
-			mean += DISPLAY_MIN
-			np.clip(mean, DISPLAY_MIN, DISPLAY_MAX, out=mean)
+			mean += display_min
+			np.clip(mean, display_min, display_max, out=mean)
 
 			np.copyto(display[y0:y1], mean.astype(np.uint8))
 			np.copyto(display[y0:y1], np.uint8(UNOBSERVED), where=counts == 0)

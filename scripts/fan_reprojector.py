@@ -11,17 +11,19 @@ from geometry_msgs.msg import Pose, Point, Quaternion
 from dynamic_reconfigure.server import Server
 from oculus_sonar.cfg import SonarReprojectorConfig
 from oculus_sonar.msg import SonarConfig
+from sonar_geometry import FOV_DEG, polar_remap, strip_gains, suppress_center_beam
 
 class SonarFanToOccupancyGrid:
 	def __init__(self):
 		rospy.init_node('fan_reprojector_node')
 		self.bridge = CvBridge()
-		self.fov_degrees = 130.0
+		self.fov_degrees = FOV_DEG
 		self.max_range_m = 40.0
 		self.downsample_factor = 1.0
 		self.sonar_frame = 'oculus_link'
 
 		self.use_compressed = rospy.get_param('~use_compressed', False)
+		self.gain_normalise = rospy.get_param('~gain_normalise', False)
 		self.image_topic = rospy.get_param('~image_topic','/oculus_sonar/image')
 		self.compressed_topic = self.image_topic+"/compressed"
 
@@ -33,12 +35,6 @@ class SonarFanToOccupancyGrid:
 		self._map_y = None
 		self._invalid_mask = None
 		self._last_remap_key = None
-
-		#Middle artefact filtering
-		self.beam_suppress_width = 8
-		self.beam_suppress_pad = 2
-		self.beam_suppress_bands = 8
-		self.beam_suppress_threshold = 2.0
 
 		if self.use_compressed:
 			self.image_sub = rospy.Subscriber(self.compressed_topic, CompressedImage, self.image_callback_compressed, queue_size=1)
@@ -58,40 +54,13 @@ class SonarFanToOccupancyGrid:
 		return config
 
 	def _rebuild_maps(self, h, w):
-		angle_range_rad = np.deg2rad(self.fov_degrees)
-		half_fov = angle_range_rad / 2.0
-		
+		half_fov = np.deg2rad(self.fov_degrees) / 2.0
+
 		# output is only the bottom half (the fan), so height = h, width = 2*h
 		out_h = h
 		out_w = 2 * h
-		cx = out_w // 2
-		cy = out_h - 1  # bottom of the half-canvas maps to range=0
 
-		ys, xs = np.indices((out_h, out_w))
-		dx = xs - cx
-		dy = cy - ys  # y increases upward in sonar space
-		r = np.sqrt(dx**2 + dy**2)
-		
-		# True real-world geometric angle of this specific pixel on the grid
-		angle = np.arctan2(dx, dy)
-
-		# Acoustic arrays are usually uniform in sine-space: sin(theta) = k * index
-		# Map physical grid angle back into unrectified sonar sensor space
-		sin_max = np.sin(half_fov)
-		# Normalize sine value between -1.0 and 1.0 across the FOV
-		norm_sin = np.sin(angle) / sin_max
-		# Remap linearly to raw image columns (0 to w-1)
-		col_map = ((norm_sin + 1.0) / 2.0) * (w - 1)
-
-		edge_noise_cut = 4
-		valid = (
-			(col_map >= 0) & (col_map < w - edge_noise_cut) &
-			(r >= 0) & (r < h) &
-			(np.abs(angle) <= half_fov)
-		)
-
-		map_x = np.where(valid, col_map, 0).astype(np.float32)
-		map_y = np.where(valid, r, 0).astype(np.float32)
+		map_x, map_y, valid = polar_remap(h, w, out_h, out_w, half_fov, 1.0, 1.0)
 
 		if self.downsample_factor != 1.0:
 			new_h = int(round(out_h * self.downsample_factor))
@@ -106,45 +75,8 @@ class SonarFanToOccupancyGrid:
 		self._last_remap_key = (h, w, self.fov_degrees, self.downsample_factor)
 
 
-	def _suppress_center_beam(self, img):
-		if self.beam_suppress_width <= 0:
-			return img
-
-		f = img.astype(np.float32)
-		h, w = f.shape
-		c = w // 2
-		half = int(self.beam_suppress_width)
-
-		lo = max(c - half, 0)
-		hi = min(c + half + 1, w)
-		rlo = max(c - half * (1 + int(self.beam_suppress_pad)), 0)
-		rhi = min(c + half * (1 + int(self.beam_suppress_pad)) + 1, w)
-
-		win = f[:, rlo:rhi]
-		il = lo - rlo
-		ir = hi - rlo
-
-		nbands = max(1, min(int(self.beam_suppress_bands), h // 8))
-		edges = np.linspace(0, h, nbands + 1).astype(int)
-		prof = np.stack([np.median(win[a:b], axis=0) for a, b in zip(edges[:-1], edges[1:])])
-
-		ref = np.median(np.concatenate([prof[:, :il], prof[:, ir:]], axis=1), axis=1, keepdims=True)
-		excess = prof - ref
-		excess[:, :il] = 0.0
-		excess[:, ir:] = 0.0
-		excess[excess < self.beam_suppress_threshold] = 0.0
-
-		if nbands > 1:
-			excess = cv2.resize(excess, (excess.shape[1], h), interpolation=cv2.INTER_LINEAR)
-		else:
-			excess = np.repeat(excess, h, axis=0)
-
-		out = img.copy()
-		out[:, rlo:rhi] = np.clip(win - excess, 0, 255).astype(img.dtype)
-		return out
-
 	def _process_image(self, img, stamp):
-		img = self._suppress_center_beam(img)
+		img = suppress_center_beam(img)
 		h, w = img.shape
 		img = cv2.flip(img, 1)
 
@@ -179,7 +111,7 @@ class SonarFanToOccupancyGrid:
 	def image_callback(self, msg):
 		self.image_sub.unregister()
 		try:
-			img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+			img = strip_gains(self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8'), self.gain_normalise)
 			self._process_image(img, msg.header.stamp)
 
 		except Exception as e:
@@ -196,7 +128,7 @@ class SonarFanToOccupancyGrid:
 			if img is None:
 				raise RuntimeError("Failed to decode compressed sonar image")
 
-			self._process_image(img, msg.header.stamp)
+			self._process_image(strip_gains(img, self.gain_normalise), msg.header.stamp)
 
 		except Exception as e:
 			rospy.logerr("Error in compressed sonar fan to occupancy grid: %s", str(e))

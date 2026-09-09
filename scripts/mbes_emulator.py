@@ -7,6 +7,7 @@ import struct
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CompressedImage, PointCloud2, PointField
 from oculus_sonar.msg import SonarConfig
+from sonar_geometry import FOV_DEG, beam_bearings, strip_gains, suppress_center_beam
 
 
 class SonarBottomDetector:
@@ -15,6 +16,7 @@ class SonarBottomDetector:
 		self.bridge = CvBridge()
 
 		self.use_compressed = rospy.get_param('~use_compressed', True)
+		self.gain_normalise = rospy.get_param('~gain_normalise', False)
 		self.image_topic = rospy.get_param('~image_topic', '/oculus_sonar/image')
 		self.compressed_topic = self.image_topic + '/compressed'
 		self.config_topic = rospy.get_param('~config_topic', '/oculus_sonar/config')
@@ -23,7 +25,7 @@ class SonarBottomDetector:
 		self.sonar_frame = rospy.get_param('~sonar_frame', 'oculus_link')
 		self.max_range_m = rospy.get_param('~initial_max_range', 30.0)
 
-		self.hfov_deg = rospy.get_param('~horizontal_fov_deg', 130.0)
+		self.hfov_deg = rospy.get_param('~horizontal_fov_deg', FOV_DEG)
 		self.vfov_deg = rospy.get_param('~vertical_fov_deg', 20.0)
 		self.elevation_offset_deg = rospy.get_param('~elevation_offset_deg', -10.0)
 		self.beam_spacing = rospy.get_param('~beam_spacing', 'sine')
@@ -45,11 +47,6 @@ class SonarBottomDetector:
 		self.max_gap = rospy.get_param('~max_gap_beams', 10)
 		self.beam_decimation = max(1, int(rospy.get_param('~beam_decimation', 1)))
 
-		self.suppress_width = rospy.get_param('~beam_suppress_width', 10)
-		self.suppress_pad = rospy.get_param('~beam_suppress_pad', 2)
-		self.suppress_bands = rospy.get_param('~beam_suppress_bands', 8)
-		self.suppress_threshold = rospy.get_param('~beam_suppress_threshold', 2.0)
-
 		self._bearings = None
 		self._bearing_key = None
 
@@ -64,45 +61,8 @@ class SonarBottomDetector:
 	def sonar_config_callback(self, msg):
 		self.max_range_m = msg.range
 
-	def _suppress_center_beam(self, f):
-		if self.suppress_width <= 0:
-			return f
-
-		h, w = f.shape
-		c = w // 2
-		half = int(self.suppress_width)
-		pad = int(self.suppress_pad)
-
-		lo = max(c - half, 0)
-		hi = min(c + half + 1, w)
-		rlo = max(c - half * (1 + pad), 0)
-		rhi = min(c + half * (1 + pad) + 1, w)
-
-		win = f[:, rlo:rhi]
-		il = lo - rlo
-		ir = hi - rlo
-
-		nbands = max(1, min(int(self.suppress_bands), h // 8))
-		edges = np.linspace(0, h, nbands + 1).astype(int)
-		prof = np.stack([np.median(win[a:b], axis=0) for a, b in zip(edges[:-1], edges[1:])])
-
-		ref = np.median(np.concatenate([prof[:, :il], prof[:, ir:]], axis=1), axis=1, keepdims=True)
-		excess = prof - ref
-		excess[:, :il] = 0.0
-		excess[:, ir:] = 0.0
-		excess[excess < self.suppress_threshold] = 0.0
-
-		if nbands > 1:
-			excess = cv2.resize(excess, (excess.shape[1], h), interpolation=cv2.INTER_LINEAR)
-		else:
-			excess = np.repeat(excess, h, axis=0)
-
-		out = f.copy()
-		out[:, rlo:rhi] = np.clip(win - excess, 0, 255)
-		return out
-
 	def _prepare(self, img):
-		f = self._suppress_center_beam(img.astype(np.float32))
+		f = suppress_center_beam(img.astype(np.float32))
 		f = cv2.boxFilter(f, -1, (self.smooth_beams, self.smooth_range), normalize=True, borderType=cv2.BORDER_REPLICATE)
 		f[:self.near_blank] = 0.0
 		return f
@@ -232,13 +192,7 @@ class SonarBottomDetector:
 		if key == self._bearing_key:
 			return self._bearings
 
-		u = 2.0 * np.arange(beams, dtype=np.float64) / max(1, beams - 1) - 1.0
-		half = math.radians(self.hfov_deg) / 2.0
-
-		if self.beam_spacing == 'angle':
-			psi = u * half
-		else:
-			psi = np.arcsin(np.clip(u * math.sin(half), -1.0, 1.0))
+		psi = beam_bearings(beams, math.radians(self.hfov_deg) / 2.0, self.beam_spacing)
 
 		if self.invert_bearing:
 			psi = -psi
@@ -302,7 +256,7 @@ class SonarBottomDetector:
 	def image_callback(self, msg):
 		self.image_sub.unregister()
 		try:
-			img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+			img = strip_gains(self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8'), self.gain_normalise)
 			self._process_image(img, msg.header.stamp)
 
 		except Exception as e:
@@ -319,7 +273,7 @@ class SonarBottomDetector:
 			if img is None:
 				raise RuntimeError("Failed to decode compressed sonar image")
 
-			self._process_image(img, msg.header.stamp)
+			self._process_image(strip_gains(img, self.gain_normalise), msg.header.stamp)
 
 		except Exception as e:
 			rospy.logerr("Error in compressed sonar bottom detector: %s", str(e))

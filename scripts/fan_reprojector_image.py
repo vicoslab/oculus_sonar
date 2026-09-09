@@ -10,12 +10,13 @@ from sensor_msgs.msg import Image, CompressedImage
 from dynamic_reconfigure.server import Server
 from oculus_sonar.cfg import SonarReprojectorConfig
 from oculus_sonar.msg import SonarConfig
+from sonar_geometry import FOV_DEG, plane_det, polar_remap, strip_gains
 
 class SonarFanToProjectedImage:
 	def __init__(self):
 		rospy.init_node('fan_reprojector_image_node')
 		self.bridge = CvBridge()
-		self.fov_degrees = 130.0
+		self.fov_degrees = FOV_DEG
 		self.max_range_m = 25.0
 		self.downsample_factor = 1.0
 		self.sonar_frame = 'oculus_link'
@@ -26,6 +27,7 @@ class SonarFanToProjectedImage:
 		self.tilt_quantum_deg = rospy.get_param('~tilt_quantum_deg', 0.5)
 
 		self.use_compressed = rospy.get_param('~use_compressed', True)
+		self.gain_normalise = rospy.get_param('~gain_normalise', False)
 		self.image_topic = rospy.get_param('~image_topic', '/oculus_sonar/image')
 		self.compressed_topic = self.image_topic + "/compressed"
 
@@ -90,11 +92,9 @@ class SonarFanToProjectedImage:
 		sin_max = np.sin(half_fov)
 
 		ground = self._ground_from_plane(pitch, roll)
-		det = ground[0, 0] * ground[1, 1] - ground[0, 1] * ground[1, 0]
-		if abs(det) < 0.2:
+		if abs(plane_det(ground)) < 0.2:
 			rospy.logwarn("Sonar mount near-vertical (pitch=%.1f deg), ignoring tilt", np.degrees(pitch))
 			ground = np.eye(2)
-			det = 1.0
 
 		# output canvas is deliberately sized to the untilted worst case rather than
 		# to the reprojected extent, so the pixel grid is identical at every tilt and
@@ -103,37 +103,8 @@ class SonarFanToProjectedImage:
 		half_w_px = int(np.ceil(self.max_range_m * sin_max / scale))
 		out_h = max(1, int(np.ceil(self.max_range_m / scale)))
 		out_w = 2 * half_w_px + 1
-		cx = half_w_px
-		cy = out_h - 1
 
-		ys, xs = np.indices((out_h, out_w))
-		cross_m = (xs - cx) * scale
-		fwd_m = (cy - ys) * scale
-
-		# invert ground @ (fwd_plane, cross_plane) = (fwd_m, cross_m) to recover
-		# in-plane forward/cross, then convert to polar range/bearing
-		a = (ground[1, 1] * fwd_m - ground[0, 1] * cross_m) / det
-		b = (ground[0, 0] * cross_m - ground[1, 0] * fwd_m) / det
-		r_m = np.sqrt(a * a + b * b)
-		angle = np.arctan2(b, a)
-
-		# acoustic arrays are uniform in sine-space: sin(theta) = k * index
-		norm_sin = np.sin(angle) / sin_max
-		col_map = ((norm_sin + 1.0) / 2.0) * (w - 1)
-
-		bin_m = self.max_range_m / h
-		row_map = r_m / bin_m - 0.5
-
-		edge_noise_cut = self.edge_noise_cut_px
-		valid = (
-			(col_map >= edge_noise_cut) & (col_map <= (w - 1) - edge_noise_cut) &
-			(row_map >= 0) & (row_map < h) &
-			(r_m <= self.max_range_m) &
-			(np.abs(angle) <= half_fov)
-		)
-
-		self._map_x = np.where(valid, col_map, 0).astype(np.float32)
-		self._map_y = np.where(valid, row_map, 0).astype(np.float32)
+		self._map_x, self._map_y, valid = polar_remap(h, w, out_h, out_w, half_fov, scale, self.max_range_m / h, ground, self.edge_noise_cut_px)
 		self._invalid_mask = ~valid
 		self._last_remap_key = remap_key
 
@@ -174,7 +145,7 @@ class SonarFanToProjectedImage:
 	def image_callback(self, msg):
 		self.image_sub.unregister()
 		try:
-			img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+			img = strip_gains(self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8'), self.gain_normalise)
 			self._process_image(img, msg.header.stamp)
 
 		except Exception as e:
@@ -191,7 +162,7 @@ class SonarFanToProjectedImage:
 			if img is None:
 				raise RuntimeError("Failed to decode compressed sonar image")
 
-			self._process_image(img, msg.header.stamp)
+			self._process_image(strip_gains(img, self.gain_normalise), msg.header.stamp)
 
 		except Exception as e:
 			rospy.logerr("Error in compressed sonar fan reprojection: %s", str(e))

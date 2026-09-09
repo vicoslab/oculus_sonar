@@ -83,9 +83,29 @@ if(TARGET rtac_display)
 endif()
 
 file(
-    GLOB PYTHON_SCRIPTS_DIR "scripts/*.py"
+    GLOB PYTHON_NODES "scripts/*.py"
 )
+set(PYTHON_MODULES ${CMAKE_CURRENT_SOURCE_DIR}/scripts/sonar_geometry.py)
+list(REMOVE_ITEM PYTHON_NODES ${PYTHON_MODULES})
+
 catkin_install_python(
-    PROGRAMS ${PYTHON_SCRIPTS_DIR}
+    PROGRAMS ${PYTHON_NODES}
+    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+file(MAKE_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION})
+
+foreach(module ${PYTHON_MODULES})
+    get_filename_component(name ${module} NAME)
+    file(REMOVE ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}/${name})
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            ${module}
+            ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}/${name}
+    )
+endforeach()
+
+install(
+    FILES ${PYTHON_MODULES}
     DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
