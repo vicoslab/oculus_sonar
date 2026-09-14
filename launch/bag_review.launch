@@ -1,0 +1,15 @@
+<launch>
+
+    <!-- Image reprojector -->
+    <node name="oculus_fan_reprojector" pkg="oculus_sonar" type="fan_reprojector.py" output="screen">
+        <param name="downsample_factor" value="1.0" /> <!--full res-->
+        <param name="use_compressed" value="true" /> <!--true for png compressed bag review-->
+    </node>
+
+    <node name="fan_assembler" pkg="oculus_sonar" type="fan_assembler.py" output="screen">
+        <param name="cell_size" value="0.07" />
+        <param name="use_compressed" value="true" />
+        <param name="fixed_frame" value="local" />
+    </node>
+
+</launch> 

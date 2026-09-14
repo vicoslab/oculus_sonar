@@ -16,7 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
 generate_dynamic_reconfigure_options(
     cfg/OculusSonar.cfg
     cfg/SonarReprojectorConfig.cfg
-    cfg/SonarReprojectorFilteredConfig.cfg
+    cfg/FanAssembler.cfg
 )
 
 find_package(oculus_driver QUIET)
@@ -30,7 +30,6 @@ if(NOT TARGET oculus_driver)
 endif()
 
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
-find_package(Eigen3 REQUIRED)
 
 add_message_files(FILES
    OculusHeader.msg
@@ -53,10 +52,7 @@ generate_messages(DEPENDENCIES
 catkin_package(CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs geometry_msgs nav_msgs tf2 tf2_ros)
 
 # replace with target include directories ?
-include_directories(${catkin_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
-
-add_executable(sonar_stitcher src/sonar_stitcher.cpp)
-target_link_libraries(sonar_stitcher ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
+include_directories(${catkin_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 
 add_executable(oculus_sonar_node
     src/OculusNode.cpp
@@ -87,9 +83,29 @@ if(TARGET rtac_display)
 endif()
 
 file(
-    GLOB PYTHON_SCRIPTS_DIR "scripts/*.py"
+    GLOB PYTHON_NODES "scripts/*.py"
 )
+set(PYTHON_MODULES ${CMAKE_CURRENT_SOURCE_DIR}/scripts/sonar_geometry.py)
+list(REMOVE_ITEM PYTHON_NODES ${PYTHON_MODULES})
+
 catkin_install_python(
-    PROGRAMS ${PYTHON_SCRIPTS_DIR}
+    PROGRAMS ${PYTHON_NODES}
+    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+file(MAKE_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION})
+
+foreach(module ${PYTHON_MODULES})
+    get_filename_component(name ${module} NAME)
+    file(REMOVE ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}/${name})
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            ${module}
+            ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}/${name}
+    )
+endforeach()
+
+install(
+    FILES ${PYTHON_MODULES}
     DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

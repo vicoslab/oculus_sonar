@@ -4,21 +4,25 @@
 #include <vector>
 #include <opencv2/imgcodecs.hpp>
 
-OculusNode::OculusNode(const std::string& nodeName): node_(nodeName), configServer_(node_),	sonar_(service_.io_service()){
-	node_.param<bool>("publish_without_subs", publishWithoutSubs_, false);
-
+OculusNode::OculusNode(const std::string& nodeName): node_(nodeName), privateNode_("~"), configServer_(privateNode_), sonar_(service_.io_service()), enabled_(false){
 	imagePublisher_ = node_.advertise<sensor_msgs::Image>("image", 100);
 	compressedImagePublisher_ = node_.advertise<sensor_msgs::CompressedImage>("image/compressed", 100);
 	configPublisher_ = node_.advertise<oculus_sonar::SonarConfig>("config", 1, true); // latched
 	temperaturePublisher_ = node_.advertise<sensor_msgs::Temperature>("temperature", 1);
 	pressurePublisher_ = node_.advertise<sensor_msgs::FluidPressure>("pressure", 1);
 
+	enabledPublisher_ = node_.advertise<std_msgs::Bool>("enabled", 1, true); // latched
+	enabledSubscriber_ = node_.subscribe("enabled", 1, &OculusNode::enabled_callback, this);
+	this->publish_enabled();
+
 	sonar_.add_ping_callback(std::bind(&OculusNode::ping_callback, this, std::placeholders::_1));
 	sonar_.add_status_callback(std::bind(&OculusNode::status_callback, this, std::placeholders::_1));
-	sonar_.add_dummy_callback(std::bind(&OculusNode::dummy_callback, this, std::placeholders::_1));
 	this->start();
 
+	// fires the callback once with the current private params, caching them until first enable
 	configServer_.setCallback(std::bind(&OculusNode::reconfigure_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+	standbyTimer_ = node_.createTimer(ros::Duration(5.0), &OculusNode::standby_timer_callback, this);
 }
 
 OculusNode::~OculusNode(){
@@ -27,33 +31,54 @@ OculusNode::~OculusNode(){
 
 void OculusNode::start(){
 	service_.start();
-	if(!sonar_.wait_next_message()) {
-		throw std::runtime_error("Timeout reached while waiting for sonar. Is it plugged in ?");
+
+	while(!sonar_.wait_next_message()) {
+		if(!ros::ok()) {
+			return;
+		}
+		ROS_WARN("Timeout reached while waiting for sonar, retrying. Is it plugged in ?");
 	}
 
-	oculus_sonar::OculusSonarConfig initialConfig;
-	node_.param<int>("frequency_mode", initialConfig.frequency_mode, 1);
-	node_.param<int>("ping_rate", initialConfig.ping_rate, 0);
-	node_.param<int>("data_depth", initialConfig.data_depth, 0);
-	node_.param<int>("nbeams", initialConfig.nbeams, 0);
-	node_.param<bool>("send_gain", initialConfig.send_gain, false);
-	node_.param<bool>("gain_assist", initialConfig.gain_assist, false);
-	node_.param<double>("range", initialConfig.range, 3.0);
-	node_.param<int>("gamma_correction", initialConfig.gamma_correction, 127);
-	node_.param<double>("gain_percent", initialConfig.gain_percent, 50.0);
-	node_.param<double>("sound_speed", initialConfig.sound_speed, 1500.0);
-	node_.param<bool>("use_salinity", initialConfig.use_salinity, true);
-	node_.param<double>("salinity", initialConfig.salinity, 35.0);
-	this->reconfigure_callback(initialConfig, 0);
+	ROS_INFO("Sonar connected");
 }
 
 void OculusNode::stop(){
 	service_.stop();
 }
 
+void OculusNode::publish_enabled(){
+	std_msgs::Bool msg;
+	msg.data = enabled_;
+	enabledPublisher_.publish(msg);
+}
+
+void OculusNode::enabled_callback(const std_msgs::Bool& msg){
+	if(msg.data == enabled_) {
+		return;
+	}
+
+	enabled_ = msg.data;
+	this->publish_enabled();
+
+	if(enabled_) {
+		ROS_INFO("Sonar enabled, applying configuration");
+		this->apply_config();
+		configServer_.updateConfig(currentConfig_);
+	} else {
+		ROS_INFO("Sonar disabled, requesting standby");
+		sonar_.standby();
+	}
+}
+
+void OculusNode::standby_timer_callback(const ros::TimerEvent& event){
+	if(!enabled_) {
+		sonar_.standby();
+	}
+}
+
 void OculusNode::ping_callback(const oculus::PingMessage::ConstPtr& ping){
-	if(!publishWithoutSubs_ && !this->has_ping_subscribers()) {
-		std::cout << "Going to standby mode" << std::endl;
+	if(!enabled_) {
+		// the driver fires the sonar on every (re)connection, push it back down
 		sonar_.standby();
 		return;
 	}
@@ -85,9 +110,9 @@ void OculusNode::status_callback(const OculusStatusMsg& status){
 	double max_temp = 0.0;
 	for(double t : {status.temperature0, status.temperature1, status.temperature2, status.temperature3, status.temperature4, status.temperature5, status.temperature6, status.temperature7}){
 		if(t > max_temp){
-            max_temp = t;
-        }
-    }
+			max_temp = t;
+		}
+	}
 
 	sensor_msgs::Temperature tempMsg;
 	tempMsg.header.stamp = stamp;
@@ -108,100 +133,95 @@ void OculusNode::status_callback(const OculusStatusMsg& status){
 }
 
 void OculusNode::reconfigure_callback(oculus_sonar::OculusSonarConfig& config, int32_t level){
-    ROS_INFO("Reconfigure callback triggered, level=%d", level);
+	currentConfig_ = config;
 
-	oculus::SonarDriver::PingConfig currentConfig;
-	std::memset(&currentConfig, 0, sizeof(currentConfig));
+	if(!enabled_) {
+		// cache only, applied on the next rising edge so the sonar stays in standby
+		return;
+	}
 
-	currentConfig.masterMode = config.frequency_mode;
-	switch(config.ping_rate)	{
-		case 0: currentConfig.pingRate = pingRateNormal;  break;
-		case 1: currentConfig.pingRate = pingRateHigh;    break;
-		case 2: currentConfig.pingRate = pingRateHighest; break;
-		case 3: currentConfig.pingRate = pingRateLow;     break;
-		case 4: currentConfig.pingRate = pingRateLowest;  break;
-		case 5: currentConfig.pingRate = pingRateStandby; break;
+	this->apply_config();
+	config = currentConfig_;
+}
+
+void OculusNode::apply_config(){
+	oculus::SonarDriver::PingConfig request;
+	std::memset(&request, 0, sizeof(request));
+
+	request.masterMode = currentConfig_.frequency_mode;
+	switch(currentConfig_.ping_rate) {
+		case 0: request.pingRate = pingRateNormal;  break;
+		case 1: request.pingRate = pingRateHigh;    break;
+		case 2: request.pingRate = pingRateHighest; break;
+		case 3: request.pingRate = pingRateLow;     break;
+		case 4: request.pingRate = pingRateLowest;  break;
+		case 5: request.pingRate = pingRateStandby; break;
 		default: break;
 	}
 
-	currentConfig.flags = 0x01  // always in meters
-	                    | 0x04  // force send gain to true
-	                    | 0x08; // use simple ping
+	request.flags = 0x01  // always in meters
+	              | 0x04  // force send gain to true
+	              | 0x08; // use simple ping
 
-	switch(config.data_depth)	{
+	switch(currentConfig_.data_depth) {
 		case oculus_sonar::OculusSonar_8bits:
 			break;
 		case oculus_sonar::OculusSonar_16bits:
-			currentConfig.flags |= 0x02;
+			request.flags |= 0x02;
 			break;
 		default: break;
 	}
 
-	switch(config.nbeams)	{
+	switch(currentConfig_.nbeams) {
 		case oculus_sonar::OculusSonar_256beams:
 			break;
 		case oculus_sonar::OculusSonar_512beams:
-			currentConfig.flags |= 0x40;
+			request.flags |= 0x40;
 			break;
 		default: break;
 	}
 
-	if(config.gain_assist)
-		currentConfig.flags |= 0x10;
+	if(currentConfig_.gain_assist)
+		request.flags |= 0x10;
 
-	currentConfig.range = config.range;
-	currentConfig.gammaCorrection = config.gamma_correction;
-	currentConfig.gainPercent = config.gain_percent;
+	request.range = currentConfig_.range;
+	request.gammaCorrection = currentConfig_.gamma_correction;
+	request.gainPercent = currentConfig_.gain_percent;
 
-	if(config.use_salinity)
-		currentConfig.speedOfSound = 0.0;
+	if(currentConfig_.use_salinity)
+		request.speedOfSound = 0.0;
 	else
-		currentConfig.speedOfSound = config.sound_speed;
-	currentConfig.salinity = config.salinity;
+		request.speedOfSound = currentConfig_.sound_speed;
+	request.salinity = currentConfig_.salinity;
 
-    
-    ROS_INFO("Requesting ping config from sonar...");
+	ROS_INFO("Requesting ping config from sonar...");
 
-	auto feedback = sonar_.request_ping_config(currentConfig);
-	config.frequency_mode = feedback.masterMode;
-	config.data_depth = (feedback.flags & 0x02) ? 1 : 0;
-	config.send_gain = (feedback.flags & 0x04) ? 1 : 0;
-	config.gain_assist = (feedback.flags & 0x10) ? 1 : 0;
-	config.nbeams = (feedback.flags & 0x40) ? 1 : 0;
-	config.range = feedback.range;
-	config.gamma_correction = feedback.gammaCorrection;
-	config.gain_percent = feedback.gainPercent;
-	config.sound_speed = feedback.speedOfSound;
-	config.salinity = feedback.salinity;
-
-    ROS_INFO("Got feedback, publishing config");
+	auto feedback = sonar_.request_ping_config(request);
+	currentConfig_.frequency_mode = feedback.masterMode;
+	currentConfig_.data_depth = (feedback.flags & 0x02) ? 1 : 0;
+	currentConfig_.send_gain = (feedback.flags & 0x04) ? 1 : 0;
+	currentConfig_.gain_assist = (feedback.flags & 0x10) ? 1 : 0;
+	currentConfig_.nbeams = (feedback.flags & 0x40) ? 1 : 0;
+	currentConfig_.range = feedback.range;
+	currentConfig_.gamma_correction = feedback.gammaCorrection;
+	currentConfig_.gain_percent = feedback.gainPercent;
+	currentConfig_.sound_speed = feedback.speedOfSound;
+	currentConfig_.salinity = feedback.salinity;
 
 	oculus_sonar::SonarConfig configMsg;
-	configMsg.frequency_mode = config.frequency_mode;
-	configMsg.ping_rate = config.ping_rate;
-	configMsg.data_depth = config.data_depth;
-	configMsg.nbeams = config.nbeams;
-	configMsg.send_gain = config.send_gain;
-	configMsg.gain_assist = config.gain_assist;
-	configMsg.range = config.range;
-	configMsg.gamma_correction = config.gamma_correction;
-	configMsg.gain_percent = config.gain_percent;
-	configMsg.sound_speed = config.sound_speed;
-	configMsg.use_salinity = config.use_salinity;
-	configMsg.salinity = config.salinity;
+	configMsg.frequency_mode = currentConfig_.frequency_mode;
+	configMsg.ping_rate = currentConfig_.ping_rate;
+	configMsg.data_depth = currentConfig_.data_depth;
+	configMsg.nbeams = currentConfig_.nbeams;
+	configMsg.send_gain = currentConfig_.send_gain;
+	configMsg.gain_assist = currentConfig_.gain_assist;
+	configMsg.range = currentConfig_.range;
+	configMsg.gamma_correction = currentConfig_.gamma_correction;
+	configMsg.gain_percent = currentConfig_.gain_percent;
+	configMsg.sound_speed = currentConfig_.sound_speed;
+	configMsg.use_salinity = currentConfig_.use_salinity;
+	configMsg.salinity = currentConfig_.salinity;
 	configPublisher_.publish(configMsg);
 
-	ROS_INFO("Config published to sonar_config topic");
-}
-
-bool OculusNode::has_ping_subscribers() const{
-	return imagePublisher_.getNumSubscribers() > 0
-		|| compressedImagePublisher_.getNumSubscribers() > 0;
-}
-
-void OculusNode::dummy_callback(const OculusMessageHeader& msg){
-	if(publishWithoutSubs_ || this->has_ping_subscribers()) {
-		std::cout << "Exiting standby mode" << std::endl;
-		sonar_.resume();
-	}
+	ROS_INFO("Sonar configuration applied");
 }
