@@ -116,6 +116,10 @@ heat up very fast).
 If the ROS node is launched, it will stop the ping emission if there are no
 subscribers on the /oculus_sonar/ping topic.
 
+The node requests version 2 ping messages from the sonar, which carry the
+heading, pitch and roll of its internal attitude sensor. These are published as
+sensor_msgs/Imu on /oculus_sonar/imu, in the oculus_link frame.
+
 
 The ping parameters can be changed using the rqt_reconfigure graphical tool.
 ```

@@ -1,0 +1,36 @@
+diff --git a/src/SonarDriver.cpp b/src/SonarDriver.cpp
+index 9a19d34..e88d811 100644
+--- a/src/SonarDriver.cpp
++++ b/src/SonarDriver.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include <oculus_driver/SonarDriver.h>
+ 
++#include <cstring>
++
+ namespace oculus {
+ 
+ SonarDriver::SonarDriver(const IoServicePtr& service,
+@@ -38,13 +40,19 @@ bool SonarDriver::send_ping_config(PingConfig config)
+     // Other non runtime-configurable parameters (TODO : make then launch parameters)
+     config.networkSpeed = 0xff;
+ 
++    OculusSimpleFireMessage2 fire;
++    std::memset(&fire, 0, sizeof(fire));
++    std::memcpy(&fire, &config, sizeof(config));
++    fire.head.msgVersion = 2;
++    fire.head.payloadSize = sizeof(fire) - sizeof(OculusMessageHeader);
++
+     boost::asio::streambuf buf;
+-    buf.sputn(reinterpret_cast<const char*>(&config), sizeof(config));
++    buf.sputn(reinterpret_cast<const char*>(&fire), sizeof(fire));
+     
+     auto bytesSent = this->send(buf);
+-    if(bytesSent != sizeof(config)) {
++    if(bytesSent != sizeof(fire)) {
+         std::cerr << "Could not send whole fire message(" << bytesSent
+-                  << "/" << sizeof(config) << ")" << std::endl;
++                  << "/" << sizeof(fire) << ")" << std::endl;
+         return false;
+     }
+ 

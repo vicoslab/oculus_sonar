@@ -1,6 +1,7 @@
 #include "OculusNode.h"
 #include "conversions.h"
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <opencv2/imgcodecs.hpp>
 
@@ -10,6 +11,7 @@ OculusNode::OculusNode(const std::string& nodeName): node_(nodeName), privateNod
 	configPublisher_ = node_.advertise<oculus_sonar::SonarConfig>("config", 1, true); // latched
 	temperaturePublisher_ = node_.advertise<sensor_msgs::Temperature>("temperature", 1);
 	pressurePublisher_ = node_.advertise<sensor_msgs::FluidPressure>("pressure", 1);
+	imuPublisher_ = node_.advertise<sensor_msgs::Imu>("imu", 10);
 
 	enabledPublisher_ = node_.advertise<std_msgs::Bool>("enabled", 1, true); // latched
 	enabledSubscriber_ = node_.subscribe("enabled", 1, &OculusNode::enabled_callback, this);
@@ -83,6 +85,12 @@ void OculusNode::ping_callback(const oculus::PingMessage::ConstPtr& ping){
 		return;
 	}
 
+	if(ping->header().msgVersion == 2) {
+		this->publish_imu(ping);
+	} else {
+		ROS_WARN_ONCE("Received a version %u ping, attitude data is only available in version 2 pings", ping->header().msgVersion);
+	}
+
 	if(imagePublisher_.getNumSubscribers() > 0) {
 		sensor_msgs::Image img;
 		oculus::copy_to_ros(img, ping);
@@ -102,6 +110,33 @@ void OculusNode::ping_callback(const oculus::PingMessage::ConstPtr& ping){
 		cv::imencode(".png", mat, img.data);
 		compressedImagePublisher_.publish(img);
 	}
+}
+
+void OculusNode::publish_imu(const oculus::PingMessage::ConstPtr& ping){
+	const auto& metadata = *reinterpret_cast<const OculusSimplePingResult2*>(ping->data().data());
+
+	const double deg = M_PI / 180.0;
+	const double half_roll = 0.5 * metadata.roll * deg;
+	const double half_pitch = 0.5 * metadata.pitch * deg;
+	const double half_yaw = 0.5 * (90.0 - metadata.heading) * deg;
+
+	const double cr = std::cos(half_roll);
+	const double sr = std::sin(half_roll);
+	const double cp = std::cos(half_pitch);
+	const double sp = std::sin(half_pitch);
+	const double cy = std::cos(half_yaw);
+	const double sy = std::sin(half_yaw);
+
+	sensor_msgs::Imu msg;
+	msg.header.stamp = oculus::to_ros_stamp(ping->timestamp());
+	msg.header.frame_id = "oculus_link";
+	msg.orientation.w = cr * cp * cy + sr * sp * sy;
+	msg.orientation.x = sr * cp * cy - cr * sp * sy;
+	msg.orientation.y = cr * sp * cy + sr * cp * sy;
+	msg.orientation.z = cr * cp * sy - sr * sp * cy;
+	msg.angular_velocity_covariance[0] = -1.0;
+	msg.linear_acceleration_covariance[0] = -1.0;
+	imuPublisher_.publish(msg);
 }
 
 void OculusNode::status_callback(const OculusStatusMsg& status){

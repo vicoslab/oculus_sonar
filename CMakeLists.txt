@@ -19,15 +19,14 @@ generate_dynamic_reconfigure_options(
     cfg/FanAssembler.cfg
 )
 
-find_package(oculus_driver QUIET)
-if(NOT TARGET oculus_driver)
-    include(FetchContent)
-    FetchContent_Declare(oculus_driver
-        GIT_REPOSITORY https://github.com/ENSTABretagneRobotics/oculus_driver.git
-        GIT_TAG        v1.2
-    )
-    FetchContent_MakeAvailable(oculus_driver)
-endif()
+include(FetchContent)
+FetchContent_Declare(oculus_driver
+    GIT_REPOSITORY https://github.com/ENSTABretagneRobotics/oculus_driver.git
+    GIT_TAG        v1.2
+    PATCH_COMMAND  git apply ${CMAKE_CURRENT_SOURCE_DIR}/patches/oculus_driver_fire_v2.patch
+    UPDATE_DISCONNECTED TRUE
+)
+FetchContent_MakeAvailable(oculus_driver)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs)
 

@@ -17,6 +17,7 @@
 #include <sensor_msgs/CompressedImage.h>
 #include <sensor_msgs/Temperature.h>
 #include <sensor_msgs/FluidPressure.h>
+#include <sensor_msgs/Imu.h>
 #include <opencv2/imgcodecs.hpp>
 
 #include <dynamic_reconfigure/server.h>
@@ -34,6 +35,7 @@ class OculusNode
 	ros::Publisher configPublisher_;
 	ros::Publisher temperaturePublisher_;
 	ros::Publisher pressurePublisher_;
+	ros::Publisher imuPublisher_;
 	ros::Publisher enabledPublisher_;
 	ros::Subscriber enabledSubscriber_;
 	ros::Timer standbyTimer_;
@@ -56,6 +58,7 @@ class OculusNode
 	void stop();
 
 	void ping_callback(const oculus::PingMessage::ConstPtr& msg);
+	void publish_imu(const oculus::PingMessage::ConstPtr& ping);
 	void status_callback(const OculusStatusMsg& status);
 	void enabled_callback(const std_msgs::Bool& msg);
 	void standby_timer_callback(const ros::TimerEvent& event);
