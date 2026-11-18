@@ -4,14 +4,15 @@ import math
 import cv2
 import numpy as np
 import tf
+import tf2_ros
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CompressedImage
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import Pose, Point, Quaternion
+from geometry_msgs.msg import Point, Quaternion, TransformStamped
 from dynamic_reconfigure.server import Server
 from oculus_sonar.cfg import SonarReprojectorConfig
 from oculus_sonar.msg import SonarConfig
-from sonar_geometry import FOV_DEG, polar_remap, strip_gains, suppress_center_beam
+from sonar_geometry import FOV_DEG, polar_remap, stabilized_offset, strip_gains, suppress_center_beam
 
 class SonarFanToOccupancyGrid:
 	def __init__(self):
@@ -21,6 +22,10 @@ class SonarFanToOccupancyGrid:
 		self.max_range_m = 40.0
 		self.downsample_factor = 1.0
 		self.sonar_frame = 'oculus_link'
+
+		self.fixed_frame = rospy.get_param('~fixed_frame', 'local')
+		self.base_frame = rospy.get_param('~base_frame', 'base_link')
+		self.stabilized_frame = rospy.get_param('~stabilized_frame', 'oculus_stabilized')
 
 		self.use_compressed = rospy.get_param('~use_compressed', False)
 		self.gain_normalise = rospy.get_param('~gain_normalise', False)
@@ -44,6 +49,27 @@ class SonarFanToOccupancyGrid:
 		self.grid_pub = rospy.Publisher(self.grid_topic, OccupancyGrid, queue_size=1)
 		self.config_sub = rospy.Subscriber(self.config_topic, SonarConfig, self.sonar_config_callback, queue_size=1)
 		self.server = Server(SonarReprojectorConfig, self.reconfig_callback)
+
+		self.tf_buffer = tf2_ros.Buffer()
+		self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+		self.tf_broadcaster = tf2_ros.TransformBroadcaster()
+
+	def publish_stabilized(self, stamp):
+		try:
+			mount = self.tf_buffer.lookup_transform(self.base_frame, self.sonar_frame, rospy.Time(0), rospy.Duration(0.2)).transform.rotation
+			q = self.tf_buffer.lookup_transform(self.fixed_frame, self.base_frame, stamp, rospy.Duration(0.2)).transform.rotation
+		except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+			rospy.logwarn_throttle(5.0, f"TF {self.fixed_frame} -> {self.base_frame} -> {self.sonar_frame} unavailable, retrying: {e}")
+			return False
+
+		msg = TransformStamped()
+		msg.header.stamp = stamp
+		msg.header.frame_id = self.sonar_frame
+		msg.child_frame_id = self.stabilized_frame
+		msg.transform.rotation = Quaternion(*stabilized_offset([q.x, q.y, q.z, q.w], [mount.x, mount.y, mount.z, mount.w]))
+		self.tf_broadcaster.sendTransform(msg)
+
+		return True
 
 	def sonar_config_callback(self, msg):
 		self.max_range_m = msg.range
@@ -76,6 +102,9 @@ class SonarFanToOccupancyGrid:
 
 
 	def _process_image(self, img, stamp):
+		if not self.publish_stabilized(stamp):
+			return
+
 		img = suppress_center_beam(img)
 		h, w = img.shape
 		img = cv2.flip(img, 1)
@@ -92,7 +121,7 @@ class SonarFanToOccupancyGrid:
 
 		grid = OccupancyGrid()
 		grid.header.stamp = stamp
-		grid.header.frame_id = self.sonar_frame
+		grid.header.frame_id = self.stabilized_frame
 		grid.info.resolution = res_m_per_pixel
 		grid.info.width = width
 		grid.info.height = height

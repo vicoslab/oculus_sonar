@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import tf.transformations as tft
 
 BEAM_COUNTS = (256, 512)
 GAIN_BYTES = 4
@@ -148,3 +149,16 @@ def polar_remap(rows, columns, canvas_h, canvas_w, half_fov, scale, bin_m, groun
 	map_y = np.where(valid, row, 0).astype(np.float32)
 
 	return map_x, map_y, valid
+
+
+def stabilized_rotation(vessel, mount):
+	roll, _, _ = tft.euler_from_quaternion(vessel)
+
+	return tft.euler_matrix(roll, 0.0, 0.0) @ tft.quaternion_matrix(mount)
+
+
+def stabilized_offset(vessel, mount):
+	roll, pitch, _ = tft.euler_from_quaternion(vessel)
+	full = tft.euler_matrix(roll, pitch, 0.0) @ tft.quaternion_matrix(mount)
+
+	return tft.quaternion_from_matrix(full.T @ stabilized_rotation(vessel, mount))

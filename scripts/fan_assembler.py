@@ -16,7 +16,7 @@ import tf.transformations as tft
 
 from oculus_sonar.cfg import FanAssemblerConfig
 from oculus_sonar.msg import SonarConfig
-from sonar_geometry import FOV_DEG, bearing_to_column, beam_bearings, plane_det, plane_inverse, strip_gains, suppress_center_beam
+from sonar_geometry import FOV_DEG, bearing_to_column, beam_bearings, plane_det, plane_inverse, stabilized_rotation, strip_gains, suppress_center_beam
 
 VERTICAL_FOV_DEG = 20.0
 GRID_MARGIN = 10
@@ -37,7 +37,8 @@ class FanAssembler:
 		self.bridge = CvBridge()
 
 		self.fixed_frame = rospy.get_param("~fixed_frame", "local")
-		self.sonar_frame = rospy.get_param("~sonar_frame", "oculus_stabilized")
+		self.base_frame = rospy.get_param("~base_frame", "base_link")
+		self.sonar_frame = rospy.get_param("~sonar_frame", "oculus_link")
 		self.cell_size = rospy.get_param("~cell_size", 0.05)
 		self.use_compressed = rospy.get_param("~use_compressed", True)
 		self.gain_normalise = rospy.get_param("~gain_normalise", False)
@@ -185,32 +186,36 @@ class FanAssembler:
 			return
 
 		try:
-			tf_stamped = self.tf_buffer.lookup_transform(self.fixed_frame, self.sonar_frame, stamp, rospy.Duration(0.2))
+			vessel_tf = self.tf_buffer.lookup_transform(self.fixed_frame, self.base_frame, stamp, rospy.Duration(0.2)).transform
+			mount_tf = self.tf_buffer.lookup_transform(self.base_frame, self.sonar_frame, rospy.Time(0), rospy.Duration(0.2)).transform
 		except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
 			rospy.logwarn_throttle(5.0, f"TF lookup failed: {e}")
 			return
 
-		t = tf_stamped.transform.translation
-		r = tf_stamped.transform.rotation
-		_, _, yaw = tft.euler_from_quaternion([r.x, r.y, r.z, r.w])
+		vessel = [vessel_tf.rotation.x, vessel_tf.rotation.y, vessel_tf.rotation.z, vessel_tf.rotation.w]
+		mount = [mount_tf.rotation.x, mount_tf.rotation.y, mount_tf.rotation.z, mount_tf.rotation.w]
+		lever = tft.quaternion_matrix(vessel)[:3, :3] @ [mount_tf.translation.x, mount_tf.translation.y, mount_tf.translation.z]
+		sx = vessel_tf.translation.x + lever[0]
+		sy = vessel_tf.translation.y + lever[1]
+
+		# full rotation, the sonar may be mounted with a substantial tilt
+		mat = tft.euler_matrix(0.0, 0.0, tft.euler_from_quaternion(vessel)[2]) @ stabilized_rotation(vessel, mount)
+		rot = mat[:2, :2]
+		_, _, yaw = tft.euler_from_matrix(mat)
 
 		if self.direction_yaw is not None:
 			diff = abs(np.arctan2(np.sin(yaw - self.direction_yaw), np.cos(yaw - self.direction_yaw)))
 			if diff > np.radians(self.cfg.direction_gate_deg):
 				return
 
-		if self.seen_viewpoint(t.x, t.y, yaw):
+		if self.seen_viewpoint(sx, sy, yaw):
 			return
-
-		# full rotation, the sonar may be mounted with a substantial tilt
-		mat = tft.quaternion_matrix([r.x, r.y, r.z, r.w])
-		rot = mat[:2, :2]
 
 		img = suppress_center_beam(img, self.cfg.beam_suppress_width, threshold=self.cfg.beam_suppress_threshold)
 
 		img = cv2.flip(img, 1)  # match the beam order convention of the display reprojector
 		intensity, valid = self.polar_frame(img)
-		self.integrate(intensity, valid, rot, t.x, t.y, self.nadir_cut(mat))
+		self.integrate(intensity, valid, rot, sx, sy, self.nadir_cut(mat))
 
 		self.frame_counter = (self.frame_counter + 1) % self.cfg.publish_every
 		if self.frame_counter == 0:
